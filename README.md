@@ -507,3 +507,4 @@ This framework is licensed under the [Apache License (Version 2.0)](https://gith
 [![Star History Chart](https://api.star-history.com/svg?repos=modelscope/ms-swift&type=Date)](https://star-history.com/#modelscope/ms-swift&Date)
 
 xxxxx
+yyyyy
