@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import hashlib
+import json
 import os
 import random
 import torch
@@ -59,6 +61,25 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self.generation_batch_size = args.generation_batch_size
         super().__init__(args, template)
 
+        self._alignment_debug_steps = int(os.getenv('SWIFT_GKD_ALIGNMENT_DEBUG_STEPS', '0'))
+        self._alignment_debug_dir = os.getenv('SWIFT_GKD_ALIGNMENT_DEBUG_DIR')
+        if self._alignment_debug_steps > 0 and not self._alignment_debug_dir:
+            self._alignment_debug_dir = os.path.join(args.output_dir, 'gkd_alignment_debug')
+        self._alignment_debug_full_logits = os.getenv('SWIFT_GKD_ALIGNMENT_DEBUG_FULL_LOGITS', '0') == '1'
+        self._alignment_micro_counts = {}
+        self._teacher_cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
+        self._teacher_cache_dir = os.getenv('SWIFT_GKD_TEACHER_CACHE_DIR')
+        if self._teacher_cache_mode not in {'', 'save', 'load'}:
+            raise ValueError('SWIFT_GKD_TEACHER_CACHE_MODE must be empty, "save", or "load".')
+        if self._teacher_cache_mode and not self._teacher_cache_dir:
+            raise ValueError('SWIFT_GKD_TEACHER_CACHE_DIR is required when teacher cache mode is enabled.')
+        if self._alignment_debug_steps > 0 and self._is_debug_rank():
+            os.makedirs(self._alignment_debug_dir, exist_ok=True)
+            logger.info(f'GKD alignment debug output: {self._alignment_debug_path}')
+        if self._teacher_cache_mode and self._is_debug_rank():
+            os.makedirs(self._teacher_cache_dir, exist_ok=True)
+            logger.info(f'GKD teacher cache mode={self._teacher_cache_mode}, dir={self._teacher_cache_dir}')
+
         if self.use_teacher_api:
             if is_last_rank():
                 self.teacher_client = VLLMInferClient(base_urls=[self.teacher_model_server])
@@ -78,6 +99,153 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         self.resample_data_iterator = None
         self._buffered_inputs = None
+
+    @property
+    def _alignment_debug_path(self):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        return os.path.join(self._alignment_debug_dir, f'rank{rank}_alignment.jsonl')
+
+    @staticmethod
+    def _is_debug_rank():
+        return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+    def _alignment_debug_active(self, step=None):
+        step = int(self.state.iteration) if step is None else int(step)
+        return self._alignment_debug_steps > 0 and step < self._alignment_debug_steps and self._is_debug_rank()
+
+    @staticmethod
+    def _cpu_float_tensor(tensor):
+        return tensor.detach().float().cpu().contiguous()
+
+    @classmethod
+    def _tensor_summary(cls, tensor, include_values=False):
+        if tensor is None:
+            return None
+        original_dtype = str(tensor.dtype)
+        value = cls._cpu_float_tensor(tensor).reshape(-1)
+        summary = {
+            'shape': list(tensor.shape),
+            'dtype': original_dtype,
+            'numel': value.numel(),
+            'sha256_fp32': hashlib.sha256(value.numpy().tobytes()).hexdigest(),
+        }
+        if value.numel():
+            summary.update({
+                'min': value.min().item(),
+                'max': value.max().item(),
+                'mean': value.mean().item(),
+                'std': value.std(unbiased=False).item(),
+                'norm': value.norm().item(),
+            })
+        if include_values:
+            summary['values'] = value.tolist()
+        return summary
+
+    @classmethod
+    def _tensor_identity(cls, tensor):
+        if tensor is None:
+            return None
+        value = tensor.detach().cpu().contiguous()
+        if value.dtype == torch.bfloat16:
+            value = value.float()
+        return {
+            'shape': list(tensor.shape),
+            'dtype': str(tensor.dtype),
+            'sha256': hashlib.sha256(value.numpy().tobytes()).hexdigest(),
+        }
+
+    def _logits_summary(self, logits, labels):
+        if logits is None:
+            return None
+        active_positions = (labels != -100).nonzero(as_tuple=False) if labels is not None else None
+        if active_positions is not None and active_positions.numel() > 0:
+            batch_idx = int(active_positions[0, 0].item())
+            seq_idx = int(active_positions[0, 1].item())
+        else:
+            batch_idx = seq_idx = 0
+        selected = logits[batch_idx, seq_idx]
+        selected_fp32 = self._cpu_float_tensor(selected)
+        k = min(20, selected_fp32.numel())
+        topk = torch.topk(selected_fp32, k=k) if k else None
+        vocab_size = selected_fp32.numel()
+        sample_ids = [idx for idx in (0, 1, 2, 3, 10, 100, 1000, 10000, 50000, 100000) if idx < vocab_size]
+        result = {
+            'full_shape': list(logits.shape),
+            'full_dtype': str(logits.dtype),
+            'batch_idx': batch_idx,
+            'seq_idx': seq_idx,
+            'selected': self._tensor_summary(selected, include_values=self._alignment_debug_full_logits),
+            'sample_token_ids': sample_ids,
+            'sample_logits': selected_fp32[sample_ids].tolist(),
+            'topk_token_ids': topk.indices.tolist() if topk is not None else [],
+            'topk_logits': topk.values.tolist() if topk is not None else [],
+        }
+        return result
+
+    def _write_alignment_record(self, record):
+        if not self._is_debug_rank():
+            return
+        os.makedirs(self._alignment_debug_dir, exist_ok=True)
+        with open(self._alignment_debug_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + '\n')
+
+    def _capture_trainable_tensors(self):
+        captured = {}
+        for model_idx, model in enumerate(self.unwrapped_models):
+            for name, parameter in model.named_parameters():
+                if parameter.requires_grad:
+                    captured[f'model{model_idx}.{name}'] = self._cpu_float_tensor(parameter)
+        return captured
+
+    def _trainable_update_summary(self, before):
+        param_values = []
+        delta_values = []
+        grad_values = []
+        per_parameter = []
+        for model_idx, model in enumerate(self.unwrapped_models):
+            for name, parameter in model.named_parameters():
+                if not parameter.requires_grad:
+                    continue
+                key = f'model{model_idx}.{name}'
+                after = self._cpu_float_tensor(parameter)
+                param_values.append(after.reshape(-1))
+                if key in before:
+                    delta_values.append((after - before[key]).reshape(-1))
+                grad = getattr(parameter, 'main_grad', None)
+                if grad is None:
+                    grad = parameter.grad
+                if grad is not None:
+                    grad_values.append(self._cpu_float_tensor(grad).reshape(-1))
+                if len(per_parameter) < 16:
+                    per_parameter.append({
+                        'name': key,
+                        'parameter': self._tensor_summary(after),
+                        'delta': self._tensor_summary(after - before[key]) if key in before else None,
+                        'gradient': self._tensor_summary(grad) if grad is not None else None,
+                    })
+        concatenate = lambda values: torch.cat(values) if values else None
+        return {
+            'parameters': self._tensor_summary(concatenate(param_values)),
+            'parameter_delta': self._tensor_summary(concatenate(delta_values)),
+            'gradient_buffers': self._tensor_summary(concatenate(grad_values)),
+            'first_parameters': per_parameter,
+        }
+
+    def train_step(self, train_data_iterator):
+        step = int(self.state.iteration)
+        debug_active = self._alignment_debug_active(step)
+        before = self._capture_trainable_tensors() if debug_active else None
+        result = super().train_step(train_data_iterator)
+        if debug_active:
+            _, grad_norm, update_successful = result
+            self._write_alignment_record({
+                'record_type': 'optimizer_step',
+                'step': step,
+                'grad_norm': float(grad_norm),
+                'update_successful': bool(update_successful),
+                'trainable_state': self._trainable_update_summary(before),
+            })
+        return result
 
     def train(self, train_dataset, val_dataset):
         if self.truncation_strategy == 'delete':
@@ -384,7 +552,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             outer_context = self.load_teacher_model_context()
 
         with torch.no_grad(), outer_context:
-            for encoded_batch in encoded_batches:
+            for teacher_micro_idx, encoded_batch in enumerate(encoded_batches):
                 opsd_batch = encoded_batch.get('opsd_teacher_batch')
                 source = opsd_batch if opsd_batch is not None else encoded_batch
                 teacher_batch = {
@@ -396,9 +564,26 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 opsd_teacher_labels = teacher_data.pop('labels', None)
                 if opsd_batch is None:
                     opsd_teacher_labels = None
-                teacher_logits = forward_step_helper(teacher_model, teacher_data)
+                step = int(self.state.iteration)
+                cache_active = self._teacher_cache_mode and step < max(self._alignment_debug_steps, 1)
+                cache_path = None
+                if cache_active:
+                    if mpu.get_tensor_model_parallel_world_size() != 1:
+                        raise ValueError('Teacher logits cache isolation currently requires tensor parallel size 1.')
+                    cache_path = os.path.join(
+                        self._teacher_cache_dir, f'teacher_step_{step:06d}_micro_{teacher_micro_idx:03d}.pt')
+                if cache_active and self._teacher_cache_mode == 'load':
+                    if not os.path.isfile(cache_path):
+                        raise FileNotFoundError(f'Teacher logits cache not found: {cache_path}')
+                    payload = torch.load(cache_path, map_location='cpu', weights_only=True)
+                    target_device = next(v.device for v in teacher_data.values() if isinstance(v, torch.Tensor))
+                    teacher_logits = payload['teacher_logits'].to(target_device)
+                else:
+                    teacher_logits = forward_step_helper(teacher_model, teacher_data)
                 if teacher_logits is not None:
                     teacher_logits = teacher_logits.detach()
+                if cache_active and self._teacher_cache_mode == 'save' and teacher_logits is not None:
+                    torch.save({'teacher_logits': teacher_logits.cpu()}, cache_path)
 
                 if topk is not None and teacher_logits is not None:
                     topk_logits, topk_indices = vocab_parallel_topk(teacher_logits, k=topk)
@@ -490,6 +675,12 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             kl_div_fn=vocab_parallel_kl_div)
         jsd_loss_val = cp_reduce(jsd_total, jsd_num_valid, cp_size=self.args.context_parallel_size)
 
+        debug_context = getattr(self, '_alignment_loss_context', None)
+        if debug_context is not None:
+            debug_context['jsd_total'] = float(jsd_total.detach().float().cpu())
+            debug_context['jsd_num_valid'] = int(jsd_num_valid.detach().cpu())
+            debug_context['jsd_loss'] = float(jsd_loss_val.detach().float().cpu())
+
         loss = jsd_loss_val
 
         # Add SFT loss if enabled (skip for student-generated responses)
@@ -540,9 +731,52 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         data.pop('loss_scale', None)
         labels = data.pop('labels', None)
 
+        step = int(self.state.iteration)
+        micro_idx = self._alignment_micro_counts.get(step, 0)
+        self._alignment_micro_counts[step] = micro_idx + 1
+        debug_active = self._alignment_debug_active(step)
+        if debug_active:
+            self._alignment_loss_context = {}
+
         if input_tensor is not None:
             unwrapped_model.set_input_tensor(input_tensor)
         student_output = model(**data)
+
+        if debug_active:
+            teacher_logits = teacher_output.full_logits
+            teacher_labels = teacher_output.opsd_teacher_labels if teacher_output.opsd_teacher_labels is not None else labels
+            record = {
+                'record_type': 'forward',
+                'step': step,
+                'micro_batch': micro_idx,
+                'input_ids': self._tensor_identity(data.get('input_ids')),
+                'position_ids': self._tensor_identity(data.get('position_ids')),
+                'labels': self._tensor_identity(labels),
+                'num_valid': int((labels != -100).sum().item()) if labels is not None else None,
+                'student_logits': self._logits_summary(student_output, labels),
+                'teacher_logits': self._logits_summary(teacher_logits, teacher_labels),
+                'teacher_topk_logprobs': self._tensor_summary(teacher_output.topk_logprobs),
+                'teacher_topk_indices': self._tensor_identity(teacher_output.topk_indices),
+            }
+
+            def write_loss_record():
+                record['loss'] = self._alignment_loss_context
+                self._write_alignment_record(record)
+                self._alignment_loss_context = None
+
+            loss_callback = partial(
+                self.loss_func,
+                labels=labels,
+                teacher_output=teacher_output,
+                data_source=data_source,
+            )
+
+            def debug_loss_callback(output_tensor):
+                result = loss_callback(output_tensor)
+                write_loss_record()
+                return result
+
+            return student_output, debug_loss_callback
 
         return student_output, partial(
             self.loss_func,

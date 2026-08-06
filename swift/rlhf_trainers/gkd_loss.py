@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Shared GKD loss utilities across HF / Megatron / Ray backends."""
+import os
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
@@ -250,6 +251,9 @@ def gkd_loss(
         s_logits, t_logits = _align_vocab(s_logits, t_logits)
         lsf, kdf = log_softmax_fn, kl_div_fn
 
+    if os.getenv('SWIFT_GKD_JSD_FP32', '0') == '1':
+        s_logits = s_logits.float()
+        t_logits = t_logits.float()
     s_logits = s_logits / temperature
     t_logits = t_logits / temperature
 
