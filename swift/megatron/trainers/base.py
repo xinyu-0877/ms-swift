@@ -701,6 +701,15 @@ class BaseMegatronTrainer(ABC):
 
     def train(self, train_dataset, val_dataset):
         train_data_iterator, val_data_iterator = self.setup_training(train_dataset, val_dataset)
+
+        if os.getenv('SWIFT_SAVE_INITIAL_ADAPTER', '0') == '1':
+            if self.state.iteration != 0:
+                raise ValueError('SWIFT_SAVE_INITIAL_ADAPTER requires a fresh run with iteration == 0.')
+            self.save_checkpoint()
+            logger.info(f'Saved initial adapter without a training step: {self.state.last_model_checkpoint}')
+            self.finalize_training()
+            return
+
         while self.state.iteration < self.args.train_iters:
             self.run_train_step(train_data_iterator, val_data_iterator)
         self.finalize_training()
