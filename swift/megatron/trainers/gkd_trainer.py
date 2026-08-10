@@ -66,6 +66,24 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         if self._alignment_debug_steps > 0 and not self._alignment_debug_dir:
             self._alignment_debug_dir = os.path.join(args.output_dir, 'gkd_alignment_debug')
         self._alignment_debug_full_logits = os.getenv('SWIFT_GKD_ALIGNMENT_DEBUG_FULL_LOGITS', '0') == '1'
+        self._alignment_full_param_sample_size = int(
+            os.getenv('SWIFT_GKD_ALIGNMENT_FULL_PARAM_SAMPLE_SIZE', '4096'))
+        if self._alignment_full_param_sample_size <= 0:
+            raise ValueError('SWIFT_GKD_ALIGNMENT_FULL_PARAM_SAMPLE_SIZE must be greater than 0.')
+        param_patterns = os.getenv('SWIFT_GKD_ALIGNMENT_FULL_PARAM_PATTERNS', '')
+        self._alignment_full_param_patterns = [p.strip() for p in param_patterns.split(',') if p.strip()]
+        if not self._alignment_full_param_patterns:
+            self._alignment_full_param_patterns = [
+                'word_embeddings.weight',
+                'linear_qkv.weight',
+                'linear_proj.weight',
+                'linear_fc1.weight',
+                'linear_fc2.weight',
+                'input_layernorm.weight',
+                'pre_mlp_layernorm.weight',
+                'final_layernorm.weight',
+                'output_layer.weight',
+            ]
         self._alignment_micro_counts = {}
         self._teacher_cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
         self._teacher_cache_dir = os.getenv('SWIFT_GKD_TEACHER_CACHE_DIR')
@@ -99,6 +117,18 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         self.resample_data_iterator = None
         self._buffered_inputs = None
+
+        if self._alignment_debug_active(0) and self.args.tuner_type == 'full':
+            teacher_models = getattr(self, 'teacher_models', None)
+            self._write_alignment_record({
+                'record_type': 'model_parameters',
+                'step': 0,
+                'mode': 'full_parameter_sampled',
+                'sample_size_per_parameter': self._alignment_full_param_sample_size,
+                'patterns': self._alignment_full_param_patterns,
+                'student': self._model_parameter_probe_summary(self.unwrapped_models),
+                'teacher': self._model_parameter_probe_summary(teacher_models) if teacher_models else None,
+            })
 
     @property
     def _alignment_debug_path(self):
@@ -189,7 +219,72 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         with open(self._alignment_debug_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + '\n')
 
+    def _is_full_parameter_probe(self, name):
+        return any(pattern in name for pattern in self._alignment_full_param_patterns)
+
+    def _sample_parameter_tensor(self, tensor):
+        value = tensor.detach()
+        try:
+            value = value.view(-1)
+        except RuntimeError:
+            value = value.reshape(-1)
+        numel = value.numel()
+        sample_size = min(numel, self._alignment_full_param_sample_size)
+        if sample_size == 0:
+            return torch.empty(0, dtype=torch.float32)
+        if sample_size == numel:
+            sampled = value
+        elif sample_size == 1:
+            sampled = value[:1]
+        else:
+            indices = torch.arange(sample_size, device=value.device, dtype=torch.int64)
+            indices = indices * (numel - 1) // (sample_size - 1)
+            sampled = value.index_select(0, indices)
+        return self._cpu_float_tensor(sampled)
+
+    def _model_parameter_probe_summary(self, models):
+        total_numel = 0
+        trainable_numel = 0
+        probes = []
+        for model_idx, model in enumerate(models or []):
+            for name, parameter in model.named_parameters():
+                total_numel += parameter.numel()
+                if parameter.requires_grad:
+                    trainable_numel += parameter.numel()
+                if not self._is_full_parameter_probe(name):
+                    continue
+                sample = self._sample_parameter_tensor(parameter)
+                probes.append({
+                    'name': f'model{model_idx}.{name}',
+                    'full_shape': list(parameter.shape),
+                    'full_dtype': str(parameter.dtype),
+                    'full_numel': parameter.numel(),
+                    'sample': self._tensor_summary(sample),
+                })
+        return {
+            'total_numel': total_numel,
+            'trainable_numel': trainable_numel,
+            'probe_count': len(probes),
+            'probes': probes,
+        }
+
+    def _capture_full_parameter_samples(self):
+        captured = {}
+        for model_idx, model in enumerate(self.unwrapped_models):
+            for name, parameter in model.named_parameters():
+                if parameter.requires_grad and self._is_full_parameter_probe(name):
+                    key = f'model{model_idx}.{name}'
+                    captured[key] = {
+                        'full_shape': list(parameter.shape),
+                        'full_dtype': str(parameter.dtype),
+                        'full_numel': parameter.numel(),
+                        'sample': self._sample_parameter_tensor(parameter),
+                    }
+        return captured
+
     def _capture_trainable_tensors(self):
+        if self.args.tuner_type == 'full':
+            return self._capture_full_parameter_samples()
         captured = {}
         for model_idx, model in enumerate(self.unwrapped_models):
             for name, parameter in model.named_parameters():
@@ -197,7 +292,57 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     captured[f'model{model_idx}.{name}'] = self._cpu_float_tensor(parameter)
         return captured
 
+    def _full_parameter_update_summary(self, before):
+        parameter_samples = []
+        delta_samples = []
+        gradient_samples = []
+        probe_parameters = []
+        trainable_numel = 0
+        probe_full_numel = 0
+        for model_idx, model in enumerate(self.unwrapped_models):
+            for name, parameter in model.named_parameters():
+                if not parameter.requires_grad:
+                    continue
+                trainable_numel += parameter.numel()
+                key = f'model{model_idx}.{name}'
+                if key not in before:
+                    continue
+                probe_full_numel += parameter.numel()
+                after_sample = self._sample_parameter_tensor(parameter)
+                before_sample = before[key]['sample']
+                delta_sample = after_sample - before_sample
+                grad = getattr(parameter, 'main_grad', None)
+                if grad is None:
+                    grad = parameter.grad
+                grad_sample = self._sample_parameter_tensor(grad) if grad is not None else None
+                parameter_samples.append(after_sample)
+                delta_samples.append(delta_sample)
+                if grad_sample is not None:
+                    gradient_samples.append(grad_sample)
+                probe_parameters.append({
+                    'name': key,
+                    'full_shape': before[key]['full_shape'],
+                    'full_dtype': before[key]['full_dtype'],
+                    'full_numel': before[key]['full_numel'],
+                    'parameter_sample': self._tensor_summary(after_sample),
+                    'delta_sample': self._tensor_summary(delta_sample),
+                    'gradient_sample': self._tensor_summary(grad_sample),
+                })
+        concatenate = lambda values: torch.cat(values) if values else None
+        return {
+            'mode': 'full_parameter_sampled',
+            'trainable_numel': trainable_numel,
+            'probe_full_numel': probe_full_numel,
+            'probe_sample_numel': sum(value.numel() for value in parameter_samples),
+            'parameter_samples': self._tensor_summary(concatenate(parameter_samples)),
+            'parameter_delta_samples': self._tensor_summary(concatenate(delta_samples)),
+            'gradient_samples': self._tensor_summary(concatenate(gradient_samples)),
+            'probe_parameters': probe_parameters,
+        }
+
     def _trainable_update_summary(self, before):
+        if self.args.tuner_type == 'full':
+            return self._full_parameter_update_summary(before)
         param_values = []
         delta_values = []
         grad_values = []
