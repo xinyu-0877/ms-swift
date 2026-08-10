@@ -65,24 +65,19 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._alignment_debug_dir = os.getenv('SWIFT_GKD_ALIGNMENT_DEBUG_DIR')
         if self._alignment_debug_steps > 0 and not self._alignment_debug_dir:
             self._alignment_debug_dir = os.path.join(args.output_dir, 'gkd_alignment_debug')
-        self._alignment_debug_full_logits = os.getenv('SWIFT_GKD_ALIGNMENT_DEBUG_FULL_LOGITS', '0') == '1'
         self._alignment_full_param_sample_size = int(
-            os.getenv('SWIFT_GKD_ALIGNMENT_FULL_PARAM_SAMPLE_SIZE', '4096'))
+            os.getenv('SWIFT_GKD_ALIGNMENT_SAMPLE_COUNT',
+                      os.getenv('SWIFT_GKD_ALIGNMENT_FULL_PARAM_SAMPLE_SIZE', '32')))
         if self._alignment_full_param_sample_size <= 0:
-            raise ValueError('SWIFT_GKD_ALIGNMENT_FULL_PARAM_SAMPLE_SIZE must be greater than 0.')
-        param_patterns = os.getenv('SWIFT_GKD_ALIGNMENT_FULL_PARAM_PATTERNS', '')
+            raise ValueError('SWIFT_GKD_ALIGNMENT_SAMPLE_COUNT must be greater than 0.')
+        param_patterns = os.getenv(
+            'SWIFT_GKD_ALIGNMENT_KEY_PATTERNS', os.getenv('SWIFT_GKD_ALIGNMENT_FULL_PARAM_PATTERNS', ''))
         self._alignment_full_param_patterns = [p.strip() for p in param_patterns.split(',') if p.strip()]
         if not self._alignment_full_param_patterns:
             self._alignment_full_param_patterns = [
                 'word_embeddings.weight',
-                'linear_qkv.weight',
-                'linear_proj.weight',
-                'linear_fc1.weight',
-                'linear_fc2.weight',
-                'input_layernorm.weight',
-                'pre_mlp_layernorm.weight',
-                'final_layernorm.weight',
-                'output_layer.weight',
+                'decoder.layers.0.self_attention.linear_qkv.weight',
+                'decoder.layers.2.mlp.linear_fc2.weight',
             ]
         self._alignment_micro_counts = {}
         self._teacher_cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
@@ -193,22 +188,17 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             seq_idx = int(active_positions[0, 1].item())
         else:
             batch_idx = seq_idx = 0
-        selected = logits[batch_idx, seq_idx]
-        selected_fp32 = self._cpu_float_tensor(selected)
-        k = min(20, selected_fp32.numel())
-        topk = torch.topk(selected_fp32, k=k) if k else None
-        vocab_size = selected_fp32.numel()
+        selected = logits[batch_idx, seq_idx].detach().reshape(-1)
+        vocab_size = selected.numel()
         sample_ids = [idx for idx in (0, 1, 2, 3, 10, 100, 1000, 10000, 50000, 100000) if idx < vocab_size]
+        sample_indices = torch.tensor(sample_ids, device=selected.device, dtype=torch.int64)
+        sample_logits = selected.index_select(0, sample_indices).float().cpu()
         result = {
-            'full_shape': list(logits.shape),
-            'full_dtype': str(logits.dtype),
             'batch_idx': batch_idx,
             'seq_idx': seq_idx,
-            'selected': self._tensor_summary(selected, include_values=self._alignment_debug_full_logits),
-            'sample_token_ids': sample_ids,
-            'sample_logits': selected_fp32[sample_ids].tolist(),
-            'topk_token_ids': topk.indices.tolist() if topk is not None else [],
-            'topk_logits': topk.values.tolist() if topk is not None else [],
+            'token_ids': sample_ids,
+            'values': sample_logits.tolist(),
+            'norm': selected.float().norm().item(),
         }
         return result
 
@@ -259,6 +249,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     'full_shape': list(parameter.shape),
                     'full_dtype': str(parameter.dtype),
                     'full_numel': parameter.numel(),
+                    'sample_indices': self._sample_parameter_indices(parameter.numel()),
                     'sample': self._tensor_summary(sample),
                 })
         return {
@@ -267,6 +258,18 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'probe_count': len(probes),
             'probes': probes,
         }
+
+    def _sample_parameter_indices(self, numel):
+        sample_size = min(numel, self._alignment_full_param_sample_size)
+        if sample_size == 0:
+            return []
+        if sample_size == numel:
+            return list(range(numel))
+        if sample_size == 1:
+            return [0]
+        indices = torch.arange(sample_size, dtype=torch.int64)
+        indices = indices * (numel - 1) // (sample_size - 1)
+        return indices.tolist()
 
     def _capture_full_parameter_samples(self):
         captured = {}
@@ -293,12 +296,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         return captured
 
     def _full_parameter_update_summary(self, before):
-        parameter_samples = []
-        delta_samples = []
-        gradient_samples = []
         probe_parameters = []
         trainable_numel = 0
-        probe_full_numel = 0
         for model_idx, model in enumerate(self.unwrapped_models):
             for name, parameter in model.named_parameters():
                 if not parameter.requires_grad:
@@ -307,7 +306,6 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 key = f'model{model_idx}.{name}'
                 if key not in before:
                     continue
-                probe_full_numel += parameter.numel()
                 after_sample = self._sample_parameter_tensor(parameter)
                 before_sample = before[key]['sample']
                 delta_sample = after_sample - before_sample
@@ -315,29 +313,16 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 if grad is None:
                     grad = parameter.grad
                 grad_sample = self._sample_parameter_tensor(grad) if grad is not None else None
-                parameter_samples.append(after_sample)
-                delta_samples.append(delta_sample)
-                if grad_sample is not None:
-                    gradient_samples.append(grad_sample)
                 probe_parameters.append({
                     'name': key,
-                    'full_shape': before[key]['full_shape'],
-                    'full_dtype': before[key]['full_dtype'],
-                    'full_numel': before[key]['full_numel'],
-                    'parameter_sample': self._tensor_summary(after_sample),
-                    'delta_sample': self._tensor_summary(delta_sample),
-                    'gradient_sample': self._tensor_summary(grad_sample),
+                    'indices': self._sample_parameter_indices(parameter.numel()),
+                    'gradient': self._tensor_summary(grad_sample, include_values=True),
+                    'delta': self._tensor_summary(delta_sample, include_values=True),
                 })
-        concatenate = lambda values: torch.cat(values) if values else None
         return {
             'mode': 'full_parameter_sampled',
             'trainable_numel': trainable_numel,
-            'probe_full_numel': probe_full_numel,
-            'probe_sample_numel': sum(value.numel() for value in parameter_samples),
-            'parameter_samples': self._tensor_summary(concatenate(parameter_samples)),
-            'parameter_delta_samples': self._tensor_summary(concatenate(delta_samples)),
-            'gradient_samples': self._tensor_summary(concatenate(gradient_samples)),
-            'probe_parameters': probe_parameters,
+            'parameters': probe_parameters,
         }
 
     def _trainable_update_summary(self, before):
@@ -383,10 +368,13 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         result = super().train_step(train_data_iterator)
         if debug_active:
             _, grad_norm, update_successful = result
+            learning_rate = next(
+                (group['lr'] for group in self.optimizer.param_groups if group.get('params')), None)
             self._write_alignment_record({
                 'record_type': 'optimizer_step',
                 'step': step,
-                'grad_norm': float(grad_norm),
+                'grad_norm': float(grad_norm) if grad_norm is not None else None,
+                'learning_rate': float(learning_rate) if learning_rate is not None else None,
                 'update_successful': bool(update_successful),
                 'trainable_state': self._trainable_update_summary(before),
             })
@@ -900,9 +888,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'num_valid': int((labels != -100).sum().item()) if labels is not None else None,
                 'student_logits': self._logits_summary(student_output, labels),
                 'teacher_logits': self._logits_summary(teacher_logits, teacher_labels),
-                'teacher_topk_logprobs': self._tensor_summary(teacher_output.topk_logprobs),
-                'teacher_topk_indices': self._tensor_identity(teacher_output.topk_indices),
             }
+            if teacher_logits is None:
+                record['teacher_topk_logprobs'] = self._tensor_summary(teacher_output.topk_logprobs)
+                record['teacher_topk_indices'] = self._tensor_identity(teacher_output.topk_indices)
 
             def write_loss_record():
                 record['loss'] = self._alignment_loss_context
