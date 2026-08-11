@@ -80,6 +80,27 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'decoder.layers.2.mlp.linear_fc2.weight',
             ]
         self._alignment_micro_counts = {}
+        self._operator_debug_enabled = os.getenv(
+            'SWIFT_GKD_OPERATOR_DEBUG', '0').lower() in {'1', 'true', 'yes'}
+        operator_patterns = os.getenv('SWIFT_GKD_OPERATOR_DEBUG_PATTERNS', '')
+        self._operator_debug_patterns = [
+            pattern.strip() for pattern in operator_patterns.split(',') if pattern.strip()
+        ]
+        if not self._operator_debug_patterns:
+            self._operator_debug_patterns = [
+                'embedding.word_embeddings',
+                'decoder.layers.0.input_layernorm',
+                'decoder.layers.0.self_attention.linear_qkv',
+                'decoder.layers.0.self_attention.core_attention',
+                'decoder.layers.0.self_attention.linear_proj',
+                'decoder.layers.0.pre_mlp_layernorm',
+                'decoder.layers.0.mlp.linear_fc1',
+                'decoder.layers.0.mlp.linear_fc2',
+                'decoder.final_layernorm',
+                'output_layer',
+            ]
+        self._operator_debug_context = None
+        self._operator_debug_handles = []
         self._teacher_cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
         self._teacher_cache_dir = os.getenv('SWIFT_GKD_TEACHER_CACHE_DIR')
         reuse_step = os.getenv('SWIFT_GKD_TEACHER_CACHE_REUSE_STEP')
@@ -135,6 +156,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'student': self._model_parameter_probe_summary(self.unwrapped_models),
                 'teacher': self._model_parameter_probe_summary(teacher_models) if teacher_models else None,
             })
+        if self._alignment_debug_active(0) and self._operator_debug_enabled:
+            self._register_operator_debug_hooks()
 
     @property
     def _alignment_debug_path(self):
@@ -219,6 +242,67 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         os.makedirs(self._alignment_debug_dir, exist_ok=True)
         with open(self._alignment_debug_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + '\n')
+
+    @staticmethod
+    def _first_tensor(value):
+        if torch.is_tensor(value):
+            return value
+        if isinstance(value, dict):
+            items = value.values()
+        elif isinstance(value, (tuple, list)):
+            items = value
+        else:
+            return None
+        for item in items:
+            tensor = MegatronGKDTrainer._first_tensor(item)
+            if tensor is not None:
+                return tensor
+        return None
+
+    def _operator_tensor_summary(self, tensor):
+        if tensor is None:
+            return None
+        sample = self._sample_parameter_tensor(tensor)
+        return {
+            'full_shape': list(tensor.shape),
+            'full_dtype': str(tensor.dtype),
+            'full_numel': tensor.numel(),
+            'sample_indices': self._sample_parameter_indices(tensor.numel()),
+            'sample': self._tensor_summary(sample, include_values=True),
+        }
+
+    def _operator_forward_hook(self, model_idx, name):
+
+        def hook(module, inputs, output):
+            context = self._operator_debug_context
+            if context is None:
+                return
+            call_key = f'model{model_idx}.{name}'
+            call_index = context['call_counts'].get(call_key, 0)
+            context['call_counts'][call_key] = call_index + 1
+            self._write_alignment_record({
+                'record_type': 'operator_forward',
+                'step': context['step'],
+                'micro_batch': context['micro_batch'],
+                'call_index': call_index,
+                'name': call_key,
+                'module_type': type(module).__name__,
+                'input': self._operator_tensor_summary(self._first_tensor(inputs)),
+                'output': self._operator_tensor_summary(self._first_tensor(output)),
+            })
+
+        return hook
+
+    def _register_operator_debug_hooks(self):
+        matched = []
+        for model_idx, model in enumerate(self.unwrapped_models):
+            for name, module in model.named_modules():
+                if not any(pattern in name for pattern in self._operator_debug_patterns):
+                    continue
+                handle = module.register_forward_hook(self._operator_forward_hook(model_idx, name))
+                self._operator_debug_handles.append(handle)
+                matched.append(f'model{model_idx}.{name} ({type(module).__name__})')
+        logger.info(f'GKD operator debug hooks registered: {matched}')
 
     def _is_full_parameter_probe(self, name):
         return any(pattern in name for pattern in self._alignment_full_param_patterns)
@@ -906,7 +990,16 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         if input_tensor is not None:
             unwrapped_model.set_input_tensor(input_tensor)
-        student_output = model(**data)
+        if debug_active and self._operator_debug_enabled:
+            self._operator_debug_context = {
+                'step': step,
+                'micro_batch': micro_idx,
+                'call_counts': {},
+            }
+        try:
+            student_output = model(**data)
+        finally:
+            self._operator_debug_context = None
 
         if debug_active:
             teacher_logits = teacher_output.full_logits
