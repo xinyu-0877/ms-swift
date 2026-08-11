@@ -82,16 +82,27 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._alignment_micro_counts = {}
         self._teacher_cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
         self._teacher_cache_dir = os.getenv('SWIFT_GKD_TEACHER_CACHE_DIR')
+        reuse_step = os.getenv('SWIFT_GKD_TEACHER_CACHE_REUSE_STEP')
+        self._teacher_cache_reuse_step = int(reuse_step) if reuse_step is not None else None
         if self._teacher_cache_mode not in {'', 'save', 'load'}:
             raise ValueError('SWIFT_GKD_TEACHER_CACHE_MODE must be empty, "save", or "load".')
         if self._teacher_cache_mode and not self._teacher_cache_dir:
             raise ValueError('SWIFT_GKD_TEACHER_CACHE_DIR is required when teacher cache mode is enabled.')
+        if self._teacher_cache_reuse_step is not None:
+            if self._teacher_cache_reuse_step < 0:
+                raise ValueError('SWIFT_GKD_TEACHER_CACHE_REUSE_STEP must be non-negative.')
+            if self._teacher_cache_mode != 'load':
+                raise ValueError('SWIFT_GKD_TEACHER_CACHE_REUSE_STEP requires teacher cache mode "load".')
         if self._alignment_debug_steps > 0 and self._is_debug_rank():
             os.makedirs(self._alignment_debug_dir, exist_ok=True)
             logger.info(f'GKD alignment debug output: {self._alignment_debug_path}')
         if self._teacher_cache_mode and self._is_debug_rank():
             os.makedirs(self._teacher_cache_dir, exist_ok=True)
             logger.info(f'GKD teacher cache mode={self._teacher_cache_mode}, dir={self._teacher_cache_dir}')
+            if self._teacher_cache_reuse_step is not None:
+                logger.warning(
+                    f'Reusing teacher logits from cache step {self._teacher_cache_reuse_step} for every step. '
+                    'The input IDs and micro-batch order must repeat exactly.')
 
         if self.use_teacher_api:
             if is_last_rank():
@@ -387,6 +398,14 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def prepare_model(self):
         super().prepare_model()
+        cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
+        cache_reuse_step = os.getenv('SWIFT_GKD_TEACHER_CACHE_REUSE_STEP')
+        if cache_mode == 'load' and cache_reuse_step is not None:
+            if self.use_teacher_api:
+                raise ValueError('teacher_model_server cannot be combined with teacher cache reuse.')
+            self.teacher_models = []
+            logger.info('Skipping local teacher model loading because a reusable teacher logits cache is enabled.')
+            return
         if self.use_teacher_api or self._is_self_distillation:
             if self._is_self_distillation:
                 logger.info('Self-distillation mode: using student model as teacher (no separate teacher loaded)')
@@ -674,7 +693,11 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
     def _compute_teacher_logits_local(self, encoded_batches: List[Dict], vp_stage: Optional[int] = None) -> None:
         topk = self.gkd_logits_topk
 
-        if self._is_self_distillation:
+        cache_only = self._teacher_cache_mode == 'load' and self._teacher_cache_reuse_step is not None
+        if cache_only:
+            teacher_model = None
+            outer_context = ContextManagers([])
+        elif self._is_self_distillation:
             teacher_model = self.unwrapped_models[0]
             adapter_contexts = []
             if self._teacher_use_disable_adapter:
@@ -698,19 +721,29 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 if opsd_batch is None:
                     opsd_teacher_labels = None
                 step = int(self.state.iteration)
-                cache_active = self._teacher_cache_mode and step < max(self._alignment_debug_steps, 1)
+                cache_active = self._teacher_cache_mode and (
+                    self._teacher_cache_reuse_step is not None
+                    or step < max(self._alignment_debug_steps, 1))
                 cache_path = None
                 if cache_active:
                     if mpu.get_tensor_model_parallel_world_size() != 1:
                         raise ValueError('Teacher logits cache isolation currently requires tensor parallel size 1.')
+                    cache_step = (
+                        self._teacher_cache_reuse_step
+                        if self._teacher_cache_reuse_step is not None else step)
                     cache_path = os.path.join(
-                        self._teacher_cache_dir, f'teacher_step_{step:06d}_micro_{teacher_micro_idx:03d}.pt')
+                        self._teacher_cache_dir, f'teacher_step_{cache_step:06d}_micro_{teacher_micro_idx:03d}.pt')
                 if cache_active and self._teacher_cache_mode == 'load':
                     if not os.path.isfile(cache_path):
                         raise FileNotFoundError(f'Teacher logits cache not found: {cache_path}')
                     payload = torch.load(cache_path, map_location='cpu', weights_only=True)
                     target_device = next(v.device for v in teacher_data.values() if isinstance(v, torch.Tensor))
                     teacher_logits = payload['teacher_logits'].to(target_device)
+                    input_ids = teacher_data.get('input_ids')
+                    if input_ids is not None and tuple(teacher_logits.shape[:2]) != tuple(input_ids.shape):
+                        raise ValueError(
+                            f'Cached teacher logits shape {tuple(teacher_logits.shape)} does not match '
+                            f'input_ids shape {tuple(input_ids.shape)} at step={step}, micro={teacher_micro_idx}.')
                 else:
                     teacher_logits = forward_step_helper(teacher_model, teacher_data)
                 if teacher_logits is not None:
