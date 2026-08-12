@@ -82,6 +82,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._alignment_micro_counts = {}
         self._operator_debug_enabled = os.getenv(
             'SWIFT_GKD_OPERATOR_DEBUG', '0').lower() in {'1', 'true', 'yes'}
+        self._operator_debug_layer_io = os.getenv(
+            'SWIFT_GKD_OPERATOR_DEBUG_LAYER_IO', '0').lower() in {'1', 'true', 'yes'}
         operator_patterns = os.getenv('SWIFT_GKD_OPERATOR_DEBUG_PATTERNS', '')
         self._operator_debug_patterns = [
             pattern.strip() for pattern in operator_patterns.split(',') if pattern.strip()
@@ -297,7 +299,13 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         matched = []
         for model_idx, model in enumerate(self.unwrapped_models):
             for name, module in model.named_modules():
-                if not any(pattern in name for pattern in self._operator_debug_patterns):
+                if self._operator_debug_layer_io:
+                    # Layer-level mode records only decoder.layers.N containers.
+                    is_layer = name.startswith('decoder.layers.') and name.count('.') == 2
+                    is_extra = name in {'embedding.word_embeddings', 'decoder.final_layernorm', 'output_layer'}
+                    if not (is_layer or is_extra):
+                        continue
+                elif not any(pattern in name for pattern in self._operator_debug_patterns):
                     continue
                 handle = module.register_forward_hook(self._operator_forward_hook(model_idx, name))
                 self._operator_debug_handles.append(handle)
