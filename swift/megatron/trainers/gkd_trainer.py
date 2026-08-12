@@ -116,6 +116,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'SWIFT_GKD_LINEAR_PROJ_ISOLATION_TARGET',
             'decoder.layers.0.self_attention.linear_proj')
         self._linear_proj_isolation_tag = os.getenv('SWIFT_GKD_LINEAR_PROJ_ISOLATION_TAG', '').lower()
+        self._linear_proj_isolation_prefix = os.getenv(
+            'SWIFT_GKD_LINEAR_PROJ_ISOLATION_PREFIX', 'linear_proj')
+        if not self._linear_proj_isolation_prefix.replace('_', '').isalnum():
+            raise ValueError('SWIFT_GKD_LINEAR_PROJ_ISOLATION_PREFIX must contain only letters, digits, or underscores.')
         self._linear_proj_isolation_done = False
         self._linear_proj_isolation_handles = []
         if self._linear_proj_isolation_mode not in {'', 'capture', 'replay'}:
@@ -338,15 +342,19 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     @property
     def _linear_proj_isolation_input_path(self):
-        return os.path.join(self._linear_proj_isolation_dir, 'linear_proj_input.pt')
+        return os.path.join(
+            self._linear_proj_isolation_dir, f'{self._linear_proj_isolation_prefix}_input.pt')
 
     @property
     def _linear_proj_isolation_weight_path(self):
-        return os.path.join(self._linear_proj_isolation_dir, 'linear_proj_weight.pt')
+        return os.path.join(
+            self._linear_proj_isolation_dir, f'{self._linear_proj_isolation_prefix}_weight.pt')
 
     def _linear_proj_isolation_output_path(self, tensor):
         tag = self._linear_proj_isolation_tag or tensor.device.type
-        return os.path.join(self._linear_proj_isolation_dir, f'linear_proj_output_{tag}.pt')
+        return os.path.join(
+            self._linear_proj_isolation_dir,
+            f'{self._linear_proj_isolation_prefix}_output_{tag}.pt')
 
     @staticmethod
     def _replace_first_tensor(args, kwargs, replacement):
