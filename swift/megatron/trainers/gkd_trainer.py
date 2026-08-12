@@ -110,6 +110,18 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             ]
         self._operator_debug_context = None
         self._operator_debug_handles = []
+        self._linear_proj_isolation_mode = os.getenv('SWIFT_GKD_LINEAR_PROJ_ISOLATION_MODE', '').lower()
+        self._linear_proj_isolation_dir = os.getenv('SWIFT_GKD_LINEAR_PROJ_ISOLATION_DIR')
+        self._linear_proj_isolation_target = os.getenv(
+            'SWIFT_GKD_LINEAR_PROJ_ISOLATION_TARGET',
+            'decoder.layers.0.self_attention.linear_proj')
+        self._linear_proj_isolation_tag = os.getenv('SWIFT_GKD_LINEAR_PROJ_ISOLATION_TAG', '').lower()
+        self._linear_proj_isolation_done = False
+        self._linear_proj_isolation_handles = []
+        if self._linear_proj_isolation_mode not in {'', 'capture', 'replay'}:
+            raise ValueError('SWIFT_GKD_LINEAR_PROJ_ISOLATION_MODE must be empty, "capture", or "replay".')
+        if self._linear_proj_isolation_mode and not self._linear_proj_isolation_dir:
+            raise ValueError('SWIFT_GKD_LINEAR_PROJ_ISOLATION_DIR is required for linear_proj isolation.')
         self._teacher_cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
         self._teacher_cache_dir = os.getenv('SWIFT_GKD_TEACHER_CACHE_DIR')
         reuse_step = os.getenv('SWIFT_GKD_TEACHER_CACHE_REUSE_STEP')
@@ -167,6 +179,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             })
         if self._alignment_debug_active(0) and self._operator_debug_enabled:
             self._register_operator_debug_hooks()
+        if self._alignment_debug_active(0) and self._linear_proj_isolation_mode:
+            self._register_linear_proj_isolation_hooks()
 
     @property
     def _alignment_debug_path(self):
@@ -321,6 +335,144 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 self._operator_debug_handles.append(handle)
                 matched.append(f'model{model_idx}.{name} ({type(module).__name__})')
         logger.info(f'GKD operator debug hooks registered: {matched}')
+
+    @property
+    def _linear_proj_isolation_input_path(self):
+        return os.path.join(self._linear_proj_isolation_dir, 'linear_proj_input.pt')
+
+    @property
+    def _linear_proj_isolation_weight_path(self):
+        return os.path.join(self._linear_proj_isolation_dir, 'linear_proj_weight.pt')
+
+    def _linear_proj_isolation_output_path(self, tensor):
+        tag = self._linear_proj_isolation_tag or tensor.device.type
+        return os.path.join(self._linear_proj_isolation_dir, f'linear_proj_output_{tag}.pt')
+
+    @staticmethod
+    def _replace_first_tensor(args, kwargs, replacement):
+        args = list(args)
+        for index, value in enumerate(args):
+            if torch.is_tensor(value):
+                args[index] = replacement
+                return tuple(args), kwargs
+        kwargs = dict(kwargs)
+        for key in ('hidden_states', 'input', 'x'):
+            if torch.is_tensor(kwargs.get(key)):
+                kwargs[key] = replacement
+                return tuple(args), kwargs
+        for key, value in kwargs.items():
+            if torch.is_tensor(value):
+                kwargs[key] = replacement
+                return tuple(args), kwargs
+        raise ValueError('Unable to find the linear_proj input tensor in args or kwargs.')
+
+    def _linear_proj_isolation_pre_hook(self, module, args, kwargs):
+        context = self._operator_debug_context
+        if context is None or context['step'] != 0 or context['micro_batch'] != 0:
+            return args, kwargs
+        if self._linear_proj_isolation_done:
+            return args, kwargs
+
+        input_tensor = self._first_tensor(args)
+        if input_tensor is None:
+            input_tensor = self._first_tensor(kwargs)
+        if input_tensor is None:
+            raise ValueError('Unable to capture the linear_proj input tensor.')
+
+        os.makedirs(self._linear_proj_isolation_dir, exist_ok=True)
+        if self._linear_proj_isolation_mode == 'capture':
+            torch.save({
+                'input': input_tensor.detach().cpu(),
+                'shape': list(input_tensor.shape),
+                'dtype': str(input_tensor.dtype),
+                'target': self._linear_proj_isolation_target,
+            }, self._linear_proj_isolation_input_path)
+            weight = getattr(module, 'weight', None)
+            bias = getattr(module, 'bias', None)
+            if weight is not None:
+                torch.save({
+                    'weight': weight.detach().cpu(),
+                    'bias': bias.detach().cpu() if bias is not None else None,
+                    'weight_shape': list(weight.shape),
+                    'weight_dtype': str(weight.dtype),
+                    'target': self._linear_proj_isolation_target,
+                }, self._linear_proj_isolation_weight_path)
+            logger.info(f'Captured common linear_proj input: {self._linear_proj_isolation_input_path}')
+            return args, kwargs
+
+        if not os.path.isfile(self._linear_proj_isolation_input_path):
+            raise FileNotFoundError(
+                f'Common linear_proj input not found: {self._linear_proj_isolation_input_path}')
+        payload = torch.load(self._linear_proj_isolation_input_path, map_location='cpu', weights_only=True)
+        common_input = payload['input']
+        if tuple(common_input.shape) != tuple(input_tensor.shape):
+            raise ValueError(
+                f'Common linear_proj input shape {tuple(common_input.shape)} does not match '
+                f'runtime input shape {tuple(input_tensor.shape)}.')
+        weight = getattr(module, 'weight', None)
+        bias = getattr(module, 'bias', None)
+        if weight is not None:
+            if not os.path.isfile(self._linear_proj_isolation_weight_path):
+                raise FileNotFoundError(
+                    f'Common linear_proj weight not found: {self._linear_proj_isolation_weight_path}')
+            weight_payload = torch.load(
+                self._linear_proj_isolation_weight_path, map_location='cpu', weights_only=True)
+            common_weight = weight_payload['weight']
+            if tuple(common_weight.shape) != tuple(weight.shape):
+                raise ValueError(
+                    f'Common linear_proj weight shape {tuple(common_weight.shape)} does not match '
+                    f'runtime weight shape {tuple(weight.shape)}.')
+            with torch.no_grad():
+                weight.copy_(common_weight.to(device=weight.device, dtype=weight.dtype))
+                common_bias = weight_payload.get('bias')
+                if bias is not None and common_bias is not None:
+                    if tuple(common_bias.shape) != tuple(bias.shape):
+                        raise ValueError(
+                            f'Common linear_proj bias shape {tuple(common_bias.shape)} does not match '
+                            f'runtime bias shape {tuple(bias.shape)}.')
+                    bias.copy_(common_bias.to(device=bias.device, dtype=bias.dtype))
+        common_input = common_input.to(device=input_tensor.device, dtype=input_tensor.dtype)
+        logger.info(
+            f'Replaying common linear_proj input and weight: {self._linear_proj_isolation_input_path}')
+        return self._replace_first_tensor(args, kwargs, common_input)
+
+    def _linear_proj_isolation_forward_hook(self, module, args, kwargs, output):
+        context = self._operator_debug_context
+        if context is None or context['step'] != 0 or context['micro_batch'] != 0:
+            return
+        if self._linear_proj_isolation_done:
+            return
+        output_tensor = self._first_tensor(output)
+        if output_tensor is None:
+            raise ValueError('Unable to capture the linear_proj output tensor.')
+        output_path = self._linear_proj_isolation_output_path(output_tensor)
+        torch.save({
+            'output': output_tensor.detach().cpu(),
+            'shape': list(output_tensor.shape),
+            'dtype': str(output_tensor.dtype),
+            'target': self._linear_proj_isolation_target,
+            'mode': self._linear_proj_isolation_mode,
+        }, output_path)
+        self._linear_proj_isolation_done = True
+        logger.info(f'Saved isolated linear_proj output: {output_path}')
+
+    def _register_linear_proj_isolation_hooks(self):
+        matched = []
+        for model_idx, model in enumerate(self.unwrapped_models):
+            for name, module in model.named_modules():
+                if name != self._linear_proj_isolation_target:
+                    continue
+                pre_handle = module.register_forward_pre_hook(
+                    self._linear_proj_isolation_pre_hook, with_kwargs=True)
+                output_handle = module.register_forward_hook(
+                    self._linear_proj_isolation_forward_hook, with_kwargs=True)
+                self._linear_proj_isolation_handles.extend([pre_handle, output_handle])
+                matched.append(f'model{model_idx}.{name} ({type(module).__name__})')
+        if not matched:
+            raise ValueError(
+                f'Linear projection isolation target not found: {self._linear_proj_isolation_target}')
+        logger.info(
+            f'GKD linear_proj isolation mode={self._linear_proj_isolation_mode}, targets={matched}')
 
     def _is_full_parameter_probe(self, name):
         return any(pattern in name for pattern in self._alignment_full_param_patterns)
@@ -1008,7 +1160,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         if input_tensor is not None:
             unwrapped_model.set_input_tensor(input_tensor)
-        if debug_active and self._operator_debug_enabled:
+        if debug_active and (self._operator_debug_enabled or self._linear_proj_isolation_mode):
             self._operator_debug_context = {
                 'step': step,
                 'micro_batch': micro_idx,
