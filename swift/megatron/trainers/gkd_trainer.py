@@ -84,6 +84,13 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'SWIFT_GKD_OPERATOR_DEBUG', '0').lower() in {'1', 'true', 'yes'}
         self._operator_debug_layer_io = os.getenv(
             'SWIFT_GKD_OPERATOR_DEBUG_LAYER_IO', '0').lower() in {'1', 'true', 'yes'}
+        layer_ids = os.getenv('SWIFT_GKD_OPERATOR_DEBUG_LAYER_IDS', '')
+        try:
+            self._operator_debug_layer_ids = {
+                int(layer_id.strip()) for layer_id in layer_ids.split(',') if layer_id.strip()
+            }
+        except ValueError as error:
+            raise ValueError('SWIFT_GKD_OPERATOR_DEBUG_LAYER_IDS must be comma-separated integers.') from error
         operator_patterns = os.getenv('SWIFT_GKD_OPERATOR_DEBUG_PATTERNS', '')
         self._operator_debug_patterns = [
             pattern.strip() for pattern in operator_patterns.split(',') if pattern.strip()
@@ -302,6 +309,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 if self._operator_debug_layer_io:
                     # Layer-level mode records only decoder.layers.N containers.
                     is_layer = name.startswith('decoder.layers.') and name.count('.') == 2
+                    if is_layer and self._operator_debug_layer_ids:
+                        layer_id = int(name.rsplit('.', 1)[-1])
+                        is_layer = layer_id in self._operator_debug_layer_ids
                     is_extra = name in {'embedding.word_embeddings', 'decoder.final_layernorm', 'output_layer'}
                     if not (is_layer or is_extra):
                         continue
