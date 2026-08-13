@@ -61,7 +61,14 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self.generation_batch_size = args.generation_batch_size
         super().__init__(args, template)
 
+        self._alignment_debug_start_step = int(os.getenv('SWIFT_GKD_ALIGNMENT_DEBUG_START_STEP', '0'))
         self._alignment_debug_steps = int(os.getenv('SWIFT_GKD_ALIGNMENT_DEBUG_STEPS', '0'))
+        if self._alignment_debug_start_step < 0:
+            raise ValueError('SWIFT_GKD_ALIGNMENT_DEBUG_START_STEP must be non-negative.')
+        if self._alignment_debug_steps < self._alignment_debug_start_step:
+            raise ValueError(
+                'SWIFT_GKD_ALIGNMENT_DEBUG_STEPS must be greater than or equal to '
+                'SWIFT_GKD_ALIGNMENT_DEBUG_START_STEP.')
         self._alignment_debug_dir = os.getenv('SWIFT_GKD_ALIGNMENT_DEBUG_DIR')
         if self._alignment_debug_steps > 0 and not self._alignment_debug_dir:
             self._alignment_debug_dir = os.path.join(args.output_dir, 'gkd_alignment_debug')
@@ -154,6 +161,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         if self._alignment_debug_steps > 0 and self._is_debug_rank():
             os.makedirs(self._alignment_debug_dir, exist_ok=True)
             logger.info(f'GKD alignment debug output: {self._alignment_debug_path}')
+            logger.info(
+                f'GKD alignment debug step range: '
+                f'[{self._alignment_debug_start_step}, {self._alignment_debug_steps})')
         if self._teacher_cache_mode and self._is_debug_rank():
             os.makedirs(self._teacher_cache_dir, exist_ok=True)
             logger.info(f'GKD teacher cache mode={self._teacher_cache_mode}, dir={self._teacher_cache_dir}')
@@ -193,7 +203,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'student': self._model_parameter_probe_summary(self.unwrapped_models),
                 'teacher': self._model_parameter_probe_summary(teacher_models) if teacher_models else None,
             })
-        if self._alignment_debug_active(0) and self._operator_debug_enabled:
+        # Hooks must be installed before training even when the debug window starts after step 0.
+        if self._alignment_debug_steps > self._alignment_debug_start_step and self._operator_debug_enabled:
             self._register_operator_debug_hooks()
         if self._alignment_debug_active(0) and self._linear_proj_isolation_mode:
             self._register_linear_proj_isolation_hooks()
@@ -211,7 +222,11 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def _alignment_debug_active(self, step=None):
         step = int(self.state.iteration) if step is None else int(step)
-        return self._alignment_debug_steps > 0 and step < self._alignment_debug_steps and self._is_debug_rank()
+        return (
+            self._alignment_debug_steps > 0
+            and self._alignment_debug_start_step <= step < self._alignment_debug_steps
+            and self._is_debug_rank()
+        )
 
     @staticmethod
     def _cpu_float_tensor(tensor):
