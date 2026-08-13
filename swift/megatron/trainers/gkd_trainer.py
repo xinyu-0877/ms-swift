@@ -126,6 +126,18 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             raise ValueError('SWIFT_GKD_LINEAR_PROJ_ISOLATION_MODE must be empty, "capture", or "replay".')
         if self._linear_proj_isolation_mode and not self._linear_proj_isolation_dir:
             raise ValueError('SWIFT_GKD_LINEAR_PROJ_ISOLATION_DIR is required for linear_proj isolation.')
+        self._flash_isolation_mode = os.getenv('SWIFT_GKD_FLASH_ISOLATION_MODE', '').lower()
+        self._flash_isolation_dir = os.getenv('SWIFT_GKD_FLASH_ISOLATION_DIR')
+        self._flash_isolation_prefix = os.getenv(
+            'SWIFT_GKD_FLASH_ISOLATION_TARGET_PREFIX',
+            'decoder.layers.0.self_attention.core_attention')
+        self._flash_isolation_tag = os.getenv('SWIFT_GKD_FLASH_ISOLATION_TAG', '').lower()
+        self._flash_isolation_done = False
+        self._flash_isolation_handles = []
+        if self._flash_isolation_mode not in {'', 'capture', 'replay'}:
+            raise ValueError('SWIFT_GKD_FLASH_ISOLATION_MODE must be empty, "capture", or "replay".')
+        if self._flash_isolation_mode and not self._flash_isolation_dir:
+            raise ValueError('SWIFT_GKD_FLASH_ISOLATION_DIR is required for Flash Attention isolation.')
         self._teacher_cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
         self._teacher_cache_dir = os.getenv('SWIFT_GKD_TEACHER_CACHE_DIR')
         reuse_step = os.getenv('SWIFT_GKD_TEACHER_CACHE_REUSE_STEP')
@@ -185,6 +197,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             self._register_operator_debug_hooks()
         if self._alignment_debug_active(0) and self._linear_proj_isolation_mode:
             self._register_linear_proj_isolation_hooks()
+        if self._alignment_debug_active(0) and self._flash_isolation_mode:
+            self._register_flash_isolation_hooks()
 
     @property
     def _alignment_debug_path(self):
@@ -481,6 +495,143 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 f'Linear projection isolation target not found: {self._linear_proj_isolation_target}')
         logger.info(
             f'GKD linear_proj isolation mode={self._linear_proj_isolation_mode}, targets={matched}')
+
+    @property
+    def _flash_isolation_input_path(self):
+        return os.path.join(self._flash_isolation_dir, 'flash_inputs.pt')
+
+    def _flash_isolation_output_path(self, tensor):
+        tag = self._flash_isolation_tag or tensor.device.type
+        return os.path.join(self._flash_isolation_dir, f'flash_output_{tag}.pt')
+
+    @staticmethod
+    def _flash_direct_tensors(args, kwargs):
+        tensors = []
+        for index, value in enumerate(args):
+            if torch.is_tensor(value):
+                tensors.append({'location': 'arg', 'key': index, 'tensor': value})
+        for key, value in kwargs.items():
+            if torch.is_tensor(value):
+                tensors.append({'location': 'kwarg', 'key': key, 'tensor': value})
+        return tensors
+
+    @staticmethod
+    def _flash_call_metadata(args, kwargs):
+        return {
+            'arg_count': len(args),
+            'kwarg_keys': sorted(kwargs),
+            'non_tensor_args': {
+                str(index): repr(value) for index, value in enumerate(args) if not torch.is_tensor(value)
+            },
+            'non_tensor_kwargs': {
+                key: repr(value) for key, value in kwargs.items() if not torch.is_tensor(value)
+            },
+        }
+
+    def _flash_isolation_pre_hook(self, module, args, kwargs):
+        context = self._operator_debug_context
+        if context is None or context['step'] != 0 or context['micro_batch'] != 0:
+            return args, kwargs
+        if self._flash_isolation_done:
+            return args, kwargs
+
+        runtime_tensors = self._flash_direct_tensors(args, kwargs)
+        if len(runtime_tensors) < 3:
+            raise ValueError(
+                f'Flash Attention isolation expected at least Q/K/V tensors, found {len(runtime_tensors)}.')
+        os.makedirs(self._flash_isolation_dir, exist_ok=True)
+
+        if self._flash_isolation_mode == 'capture':
+            payload_tensors = []
+            for item in runtime_tensors:
+                payload_tensors.append({
+                    'location': item['location'],
+                    'key': item['key'],
+                    'tensor': item['tensor'].detach().cpu(),
+                    'shape': list(item['tensor'].shape),
+                    'dtype': str(item['tensor'].dtype),
+                })
+            torch.save({
+                'tensors': payload_tensors,
+                'metadata': self._flash_call_metadata(args, kwargs),
+                'target_prefix': self._flash_isolation_prefix,
+                'module_type': type(module).__name__,
+            }, self._flash_isolation_input_path)
+            logger.info(f'Captured common Flash Attention inputs: {self._flash_isolation_input_path}')
+            return args, kwargs
+
+        if not os.path.isfile(self._flash_isolation_input_path):
+            raise FileNotFoundError(f'Common Flash Attention inputs not found: {self._flash_isolation_input_path}')
+        payload = torch.load(self._flash_isolation_input_path, map_location='cpu', weights_only=True)
+        saved_tensors = payload['tensors']
+        saved_metadata = payload['metadata']
+        runtime_metadata = self._flash_call_metadata(args, kwargs)
+        if saved_metadata != runtime_metadata:
+            raise ValueError(
+                f'Flash Attention call metadata does not match the captured call. '
+                f'captured={saved_metadata}, runtime={runtime_metadata}')
+        runtime_by_location = {
+            (item['location'], item['key']): item for item in runtime_tensors
+        }
+        args = list(args)
+        kwargs = dict(kwargs)
+        for saved in saved_tensors:
+            location_key = (saved['location'], saved['key'])
+            if location_key not in runtime_by_location:
+                raise ValueError(f'Flash Attention runtime argument is missing: {location_key}.')
+            runtime = runtime_by_location[location_key]['tensor']
+            common = saved['tensor']
+            if tuple(common.shape) != tuple(runtime.shape):
+                raise ValueError(
+                    f'Flash Attention tensor {location_key} shape {tuple(common.shape)} does not match '
+                    f'runtime shape {tuple(runtime.shape)}.')
+            common = common.to(device=runtime.device, dtype=runtime.dtype)
+            if saved['location'] == 'arg':
+                args[int(saved['key'])] = common
+            else:
+                kwargs[saved['key']] = common
+        logger.info(f'Replaying common Flash Attention inputs: {self._flash_isolation_input_path}')
+        return tuple(args), kwargs
+
+    def _flash_isolation_forward_hook(self, module, args, kwargs, output):
+        context = self._operator_debug_context
+        if context is None or context['step'] != 0 or context['micro_batch'] != 0:
+            return
+        if self._flash_isolation_done:
+            return
+        output_tensor = self._first_tensor(output)
+        if output_tensor is None:
+            raise ValueError('Unable to capture the Flash Attention output tensor.')
+        output_path = self._flash_isolation_output_path(output_tensor)
+        torch.save({
+            'output': output_tensor.detach().cpu(),
+            'shape': list(output_tensor.shape),
+            'dtype': str(output_tensor.dtype),
+            'mode': self._flash_isolation_mode,
+            'target_prefix': self._flash_isolation_prefix,
+        }, output_path)
+        self._flash_isolation_done = True
+        logger.info(f'Saved isolated Flash Attention output: {output_path}')
+
+    def _register_flash_isolation_hooks(self):
+        matched = []
+        for model_idx, model in enumerate(self.unwrapped_models):
+            for name, module in model.named_modules():
+                if not name.startswith(self._flash_isolation_prefix):
+                    continue
+                if type(module).__name__ != 'FlashAttention':
+                    continue
+                pre_handle = module.register_forward_pre_hook(
+                    self._flash_isolation_pre_hook, with_kwargs=True)
+                output_handle = module.register_forward_hook(
+                    self._flash_isolation_forward_hook, with_kwargs=True)
+                self._flash_isolation_handles.extend([pre_handle, output_handle])
+                matched.append(f'model{model_idx}.{name} ({type(module).__name__})')
+        if len(matched) != 1:
+            raise ValueError(
+                f'Expected exactly one Flash Attention isolation target under '
+                f'{self._flash_isolation_prefix}, found: {matched}')
+        logger.info(f'GKD Flash Attention isolation mode={self._flash_isolation_mode}, targets={matched}')
 
     def _is_full_parameter_probe(self, name):
         return any(pattern in name for pattern in self._alignment_full_param_patterns)
@@ -1168,7 +1319,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         if input_tensor is not None:
             unwrapped_model.set_input_tensor(input_tensor)
-        if debug_active and (self._operator_debug_enabled or self._linear_proj_isolation_mode):
+        if debug_active and (
+                self._operator_debug_enabled
+                or self._linear_proj_isolation_mode
+                or self._flash_isolation_mode):
             self._operator_debug_context = {
                 'step': step,
                 'micro_batch': micro_idx,
