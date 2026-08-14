@@ -61,8 +61,8 @@ def run(args):
 
 
 def tensor_metrics(gpu_tensor, npu_tensor):
-    gpu_tensor = gpu_tensor.float().reshape(-1)
-    npu_tensor = npu_tensor.float().reshape(-1)
+    gpu_tensor = gpu_tensor.double().reshape(-1)
+    npu_tensor = npu_tensor.double().reshape(-1)
     if gpu_tensor.shape != npu_tensor.shape:
         raise ValueError(f'Tensor shape mismatch: GPU {gpu_tensor.shape}, NPU {npu_tensor.shape}.')
     diff = gpu_tensor - npu_tensor
@@ -70,12 +70,13 @@ def tensor_metrics(gpu_tensor, npu_tensor):
     npu_norm = torch.linalg.vector_norm(npu_tensor)
     denominator = torch.maximum(gpu_norm, npu_norm).clamp_min(1e-30)
     cosine_denominator = (gpu_norm * npu_norm).clamp_min(1e-30)
+    cosine = (torch.dot(gpu_tensor, npu_tensor) / cosine_denominator).clamp(-1, 1)
     return {
         'shape': list(gpu_tensor.shape),
         'max_abs': diff.abs().max().item(),
         'mean_abs': diff.abs().mean().item(),
         'relative_l2': (torch.linalg.vector_norm(diff) / denominator).item(),
-        'cosine': (torch.dot(gpu_tensor, npu_tensor) / cosine_denominator).item(),
+        'cosine': cosine.item(),
         'different_ratio': (gpu_tensor != npu_tensor).float().mean().item(),
         'gpu_norm': gpu_norm.item(),
         'npu_norm': npu_norm.item(),

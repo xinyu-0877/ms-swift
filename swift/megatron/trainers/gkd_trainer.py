@@ -161,12 +161,16 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'SWIFT_GKD_FLASH_ISOLATION_TARGET_PREFIX',
             'decoder.layers.0.self_attention.core_attention')
         self._flash_isolation_tag = os.getenv('SWIFT_GKD_FLASH_ISOLATION_TAG', '').lower()
+        self._flash_isolation_step = int(os.getenv('SWIFT_GKD_FLASH_ISOLATION_STEP', '0'))
+        self._flash_isolation_micro_batch = int(os.getenv('SWIFT_GKD_FLASH_ISOLATION_MICRO_BATCH', '0'))
         self._flash_isolation_done = False
         self._flash_isolation_handles = []
         if self._flash_isolation_mode not in {'', 'capture', 'replay'}:
             raise ValueError('SWIFT_GKD_FLASH_ISOLATION_MODE must be empty, "capture", or "replay".')
         if self._flash_isolation_mode and not self._flash_isolation_dir:
             raise ValueError('SWIFT_GKD_FLASH_ISOLATION_DIR is required for Flash Attention isolation.')
+        if self._flash_isolation_step < 0 or self._flash_isolation_micro_batch < 0:
+            raise ValueError('Flash Attention isolation step and micro-batch must be non-negative.')
         self._swiglu_isolation_mode = os.getenv('SWIFT_GKD_SWIGLU_ISOLATION_MODE', '').lower()
         self._swiglu_isolation_dir = os.getenv('SWIFT_GKD_SWIGLU_ISOLATION_DIR')
         self._swiglu_isolation_target = os.getenv(
@@ -247,7 +251,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             self._register_backward_debug_hooks()
         if self._alignment_debug_active(0) and self._linear_proj_isolation_mode:
             self._register_linear_proj_isolation_hooks()
-        if self._alignment_debug_active(0) and self._flash_isolation_mode:
+        if self._flash_isolation_mode:
             self._register_flash_isolation_hooks()
         if self._swiglu_isolation_mode:
             self._register_swiglu_isolation_hooks()
@@ -694,7 +698,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def _flash_isolation_pre_hook(self, module, args, kwargs):
         context = self._operator_debug_context
-        if context is None or context['step'] != 0 or context['micro_batch'] != 0:
+        if context is None or (
+                context['step'] != self._flash_isolation_step
+                or context['micro_batch'] != self._flash_isolation_micro_batch):
             return args, kwargs
         if self._flash_isolation_done:
             return args, kwargs
@@ -759,7 +765,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def _flash_isolation_forward_hook(self, module, args, kwargs, output):
         context = self._operator_debug_context
-        if context is None or context['step'] != 0 or context['micro_batch'] != 0:
+        if context is None or (
+                context['step'] != self._flash_isolation_step
+                or context['micro_batch'] != self._flash_isolation_micro_batch):
             return
         if self._flash_isolation_done:
             return
