@@ -135,6 +135,23 @@ def _patch_mcore_bridge():
         args=None,
         processor=None,
     ) -> None:
+        if isinstance(max_shard_size, str):
+            normalized_size = max_shard_size.strip().upper()
+            size_units = {
+                'KB': 1024,
+                'MB': 1024**2,
+                'GB': 1024**3,
+                'TB': 1024**4,
+            }
+            for unit, multiplier in size_units.items():
+                if not normalized_size.endswith(unit):
+                    continue
+                size_value = normalized_size[:-len(unit)].strip()
+                try:
+                    max_shard_size = int(float(size_value) * multiplier)
+                except ValueError:
+                    pass
+                break
         origin_save_weights(self, mg_models, output_dir, peft_format=peft_format, max_shard_size=max_shard_size)
         if processor is None or args is None:
             return
