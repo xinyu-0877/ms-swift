@@ -117,6 +117,17 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             ]
         self._operator_debug_context = None
         self._operator_debug_handles = []
+        self._backward_debug_enabled = os.getenv(
+            'SWIFT_GKD_BACKWARD_DEBUG', '0').lower() in {'1', 'true', 'yes'}
+        backward_patterns = os.getenv(
+            'SWIFT_GKD_BACKWARD_DEBUG_PATTERNS',
+            'decoder.layers.0.self_attention.linear_qkv,decoder.layers.2.mlp.linear_fc2')
+        self._backward_debug_patterns = [
+            pattern.strip() for pattern in backward_patterns.split(',') if pattern.strip()
+        ]
+        self._backward_debug_context = None
+        self._backward_debug_handles = []
+        self._backward_debug_written = set()
         self._linear_proj_isolation_mode = os.getenv('SWIFT_GKD_LINEAR_PROJ_ISOLATION_MODE', '').lower()
         self._linear_proj_isolation_dir = os.getenv('SWIFT_GKD_LINEAR_PROJ_ISOLATION_DIR')
         self._linear_proj_isolation_target = os.getenv(
@@ -206,6 +217,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         # Hooks must be installed before training even when the debug window starts after step 0.
         if self._alignment_debug_steps > self._alignment_debug_start_step and self._operator_debug_enabled:
             self._register_operator_debug_hooks()
+        if self._alignment_debug_steps > self._alignment_debug_start_step and self._backward_debug_enabled:
+            self._register_backward_debug_hooks()
         if self._alignment_debug_active(0) and self._linear_proj_isolation_mode:
             self._register_linear_proj_isolation_hooks()
         if self._alignment_debug_active(0) and self._flash_isolation_mode:
@@ -368,6 +381,42 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 self._operator_debug_handles.append(handle)
                 matched.append(f'model{model_idx}.{name} ({type(module).__name__})')
         logger.info(f'GKD operator debug hooks registered: {matched}')
+
+    def _backward_debug_hook(self, model_idx, name):
+
+        def hook(module, grad_input, grad_output):
+            context = self._backward_debug_context
+            if context is None or not self._alignment_debug_active(context['step']):
+                return
+            key = (context['step'], context['micro_batch'], model_idx, name)
+            if key in self._backward_debug_written:
+                return
+            self._backward_debug_written.add(key)
+            self._write_alignment_record({
+                'record_type': 'module_backward',
+                'step': context['step'],
+                'micro_batch': context['micro_batch'],
+                'name': f'model{model_idx}.{name}',
+                'module_type': type(module).__name__,
+                'input_gradient': self._operator_tensor_summary(self._first_tensor(grad_input)),
+                'output_gradient': self._operator_tensor_summary(self._first_tensor(grad_output)),
+            })
+
+        return hook
+
+    def _register_backward_debug_hooks(self):
+        matched = []
+        for model_idx, model in enumerate(self.unwrapped_models):
+            for name, module in model.named_modules():
+                if name not in self._backward_debug_patterns:
+                    continue
+                handle = module.register_full_backward_hook(self._backward_debug_hook(model_idx, name))
+                self._backward_debug_handles.append(handle)
+                matched.append(f'model{model_idx}.{name} ({type(module).__name__})')
+        if not matched:
+            raise ValueError(
+                f'No backward debug module matched exact patterns: {self._backward_debug_patterns}')
+        logger.info(f'GKD backward debug hooks registered: {matched}')
 
     @property
     def _linear_proj_isolation_input_path(self):
@@ -734,6 +783,73 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     captured[f'model{model_idx}.{name}'] = self._cpu_float_tensor(parameter)
         return captured
 
+    def _backward_debug_parameters(self):
+        result = []
+        for model_idx, model in enumerate(self.unwrapped_models):
+            for name, parameter in model.named_parameters():
+                module_name = name.rsplit('.', 1)[0]
+                if parameter.requires_grad and module_name in self._backward_debug_patterns:
+                    result.append((f'model{model_idx}.{name}', parameter))
+        return result
+
+    @staticmethod
+    def _optimizer_objects(optimizer):
+        pending = [optimizer]
+        visited = set()
+        while pending:
+            current = pending.pop()
+            if current is None or id(current) in visited:
+                continue
+            visited.add(id(current))
+            yield current
+            child = getattr(current, 'optimizer', None)
+            if child is not None and child is not current:
+                pending.append(child)
+            pending.extend(getattr(current, 'chained_optimizers', None) or [])
+
+    def _optimizer_parameter_state(self, parameter):
+        candidates = [parameter]
+        main_param = getattr(parameter, 'main_param', None)
+        if torch.is_tensor(main_param):
+            candidates.append(main_param)
+        optimizer_type = type(self.optimizer).__name__
+        for optimizer in self._optimizer_objects(self.optimizer):
+            optimizer_type = f'{optimizer_type}->{type(optimizer).__name__}'
+            fp16_groups = getattr(optimizer, 'float16_groups', None) or []
+            fp32_groups = getattr(optimizer, 'fp32_from_float16_groups', None) or []
+            for model_group, master_group in zip(fp16_groups, fp32_groups):
+                for model_parameter, master_parameter in zip(model_group, master_group):
+                    if model_parameter is parameter:
+                        candidates.append(master_parameter)
+            state = getattr(optimizer, 'state', None)
+            if state is None:
+                continue
+            for candidate in candidates:
+                if candidate not in state:
+                    continue
+                values = state[candidate]
+                master = candidate if candidate is not parameter else main_param
+                return {
+                    'optimizer_type': optimizer_type,
+                    'master_parameter': self._operator_tensor_summary(master) if torch.is_tensor(master) else None,
+                    'exp_avg': self._operator_tensor_summary(values.get('exp_avg')),
+                    'exp_avg_sq': self._operator_tensor_summary(values.get('exp_avg_sq')),
+                    'step': str(values.get('step')) if values.get('step') is not None else None,
+                }
+        return {
+            'optimizer_type': optimizer_type,
+            'master_parameter': self._operator_tensor_summary(main_param) if torch.is_tensor(main_param) else None,
+            'exp_avg': None,
+            'exp_avg_sq': None,
+            'step': None,
+        }
+
+    def _capture_optimizer_debug_state(self):
+        return {
+            name: self._optimizer_parameter_state(parameter)
+            for name, parameter in self._backward_debug_parameters()
+        }
+
     def _full_parameter_update_summary(self, before):
         probe_parameters = []
         trainable_numel = 0
@@ -804,6 +920,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         step = int(self.state.iteration)
         debug_active = self._alignment_debug_active(step)
         before = self._capture_trainable_tensors() if debug_active else None
+        optimizer_before = (
+            self._capture_optimizer_debug_state()
+            if debug_active and self._backward_debug_enabled else None
+        )
         result = super().train_step(train_data_iterator)
         if debug_active:
             _, grad_norm, update_successful = result
@@ -816,6 +936,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'learning_rate': float(learning_rate) if learning_rate is not None else None,
                 'update_successful': bool(update_successful),
                 'trainable_state': self._trainable_update_summary(before),
+                'optimizer_state_before': optimizer_before,
+                'optimizer_state_after': (
+                    self._capture_optimizer_debug_state() if self._backward_debug_enabled else None),
             })
         return result
 
@@ -1379,6 +1502,23 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             )
 
             def debug_loss_callback(output_tensor):
+                if self._backward_debug_enabled:
+                    self._backward_debug_context = {
+                        'step': step,
+                        'micro_batch': micro_idx,
+                    }
+
+                    def logits_gradient_hook(gradient):
+                        self._write_alignment_record({
+                            'record_type': 'student_logits_backward',
+                            'step': step,
+                            'micro_batch': micro_idx,
+                            'gradient': self._operator_tensor_summary(gradient),
+                        })
+                        return gradient
+
+                    if output_tensor.requires_grad:
+                        output_tensor.register_hook(logits_gradient_hook)
                 result = loss_callback(output_tensor)
                 write_loss_record()
                 return result
