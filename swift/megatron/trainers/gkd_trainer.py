@@ -128,6 +128,17 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._backward_debug_context = None
         self._backward_debug_handles = []
         self._backward_debug_written = set()
+        self._jsd_isolation_mode = os.getenv('SWIFT_GKD_JSD_ISOLATION_MODE', '').lower()
+        self._jsd_isolation_dir = os.getenv('SWIFT_GKD_JSD_ISOLATION_DIR')
+        self._jsd_isolation_step = int(os.getenv('SWIFT_GKD_JSD_ISOLATION_STEP', '13'))
+        self._jsd_isolation_micro_batch = int(os.getenv('SWIFT_GKD_JSD_ISOLATION_MICRO_BATCH', '1'))
+        self._jsd_isolation_done = False
+        if self._jsd_isolation_mode not in {'', 'capture'}:
+            raise ValueError('SWIFT_GKD_JSD_ISOLATION_MODE must be empty or "capture".')
+        if self._jsd_isolation_mode and not self._jsd_isolation_dir:
+            raise ValueError('SWIFT_GKD_JSD_ISOLATION_DIR is required for JSD isolation capture.')
+        if self._jsd_isolation_step < 0 or self._jsd_isolation_micro_batch < 0:
+            raise ValueError('JSD isolation step and micro-batch must be non-negative.')
         self._linear_proj_isolation_mode = os.getenv('SWIFT_GKD_LINEAR_PROJ_ISOLATION_MODE', '').lower()
         self._linear_proj_isolation_dir = os.getenv('SWIFT_GKD_LINEAR_PROJ_ISOLATION_DIR')
         self._linear_proj_isolation_target = os.getenv(
@@ -311,6 +322,40 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         os.makedirs(self._alignment_debug_dir, exist_ok=True)
         with open(self._alignment_debug_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + '\n')
+
+    def _capture_jsd_isolation_inputs(self, student_logits, teacher_output, labels, step, micro_batch):
+        if self._jsd_isolation_mode != 'capture' or self._jsd_isolation_done:
+            return
+        if step != self._jsd_isolation_step or micro_batch != self._jsd_isolation_micro_batch:
+            return
+        if not self._is_debug_rank():
+            return
+        os.makedirs(self._jsd_isolation_dir, exist_ok=True)
+        path = os.path.join(
+            self._jsd_isolation_dir,
+            f'jsd_inputs_step_{step:06d}_micro_{micro_batch:03d}.pt')
+        torch.save({
+            'student_logits': student_logits.detach().cpu(),
+            'teacher_logits': (
+                teacher_output.full_logits.detach().cpu()
+                if teacher_output.full_logits is not None else None),
+            'teacher_topk_logprobs': (
+                teacher_output.topk_logprobs.detach().cpu()
+                if teacher_output.topk_logprobs is not None else None),
+            'teacher_topk_indices': (
+                teacher_output.topk_indices.detach().cpu()
+                if teacher_output.topk_indices is not None else None),
+            'opsd_teacher_labels': (
+                teacher_output.opsd_teacher_labels.detach().cpu()
+                if teacher_output.opsd_teacher_labels is not None else None),
+            'labels': labels.detach().cpu(),
+            'beta': float(self.beta),
+            'temperature': float(self.temperature),
+            'step': int(step),
+            'micro_batch': int(micro_batch),
+        }, path)
+        self._jsd_isolation_done = True
+        logger.info(f'Captured common JSD backward inputs: {path}')
 
     @staticmethod
     def _first_tensor(value):
@@ -1470,6 +1515,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             student_output = model(**data)
         finally:
             self._operator_debug_context = None
+
+        self._capture_jsd_isolation_inputs(
+            student_output, teacher_output, labels, step, micro_idx)
 
         if debug_active:
             teacher_logits = teacher_output.full_logits
