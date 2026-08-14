@@ -167,6 +167,21 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             raise ValueError('SWIFT_GKD_FLASH_ISOLATION_MODE must be empty, "capture", or "replay".')
         if self._flash_isolation_mode and not self._flash_isolation_dir:
             raise ValueError('SWIFT_GKD_FLASH_ISOLATION_DIR is required for Flash Attention isolation.')
+        self._swiglu_isolation_mode = os.getenv('SWIFT_GKD_SWIGLU_ISOLATION_MODE', '').lower()
+        self._swiglu_isolation_dir = os.getenv('SWIFT_GKD_SWIGLU_ISOLATION_DIR')
+        self._swiglu_isolation_target = os.getenv(
+            'SWIFT_GKD_SWIGLU_ISOLATION_TARGET',
+            'decoder.layers.2.mlp.linear_fc1')
+        self._swiglu_isolation_step = int(os.getenv('SWIFT_GKD_SWIGLU_ISOLATION_STEP', '0'))
+        self._swiglu_isolation_micro_batch = int(os.getenv('SWIFT_GKD_SWIGLU_ISOLATION_MICRO_BATCH', '0'))
+        self._swiglu_isolation_done = False
+        self._swiglu_isolation_handles = []
+        if self._swiglu_isolation_mode not in {'', 'capture'}:
+            raise ValueError('SWIFT_GKD_SWIGLU_ISOLATION_MODE must be empty or "capture".')
+        if self._swiglu_isolation_mode and not self._swiglu_isolation_dir:
+            raise ValueError('SWIFT_GKD_SWIGLU_ISOLATION_DIR is required for SwiGLU isolation.')
+        if self._swiglu_isolation_step < 0 or self._swiglu_isolation_micro_batch < 0:
+            raise ValueError('SwiGLU isolation step and micro-batch must be non-negative.')
         self._teacher_cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
         self._teacher_cache_dir = os.getenv('SWIFT_GKD_TEACHER_CACHE_DIR')
         reuse_step = os.getenv('SWIFT_GKD_TEACHER_CACHE_REUSE_STEP')
@@ -234,6 +249,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             self._register_linear_proj_isolation_hooks()
         if self._alignment_debug_active(0) and self._flash_isolation_mode:
             self._register_flash_isolation_hooks()
+        if self._swiglu_isolation_mode:
+            self._register_swiglu_isolation_hooks()
 
     @property
     def _alignment_debug_path(self):
@@ -426,6 +443,44 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 self._operator_debug_handles.append(handle)
                 matched.append(f'model{model_idx}.{name} ({type(module).__name__})')
         logger.info(f'GKD operator debug hooks registered: {matched}')
+
+    def _swiglu_isolation_hook(self, name):
+
+        def hook(module, inputs, output):
+            context = self._operator_debug_context
+            if context is None or self._swiglu_isolation_done:
+                return
+            if (context['step'] != self._swiglu_isolation_step
+                    or context['micro_batch'] != self._swiglu_isolation_micro_batch):
+                return
+            tensor = self._first_tensor(output)
+            if tensor is None:
+                raise RuntimeError(f'SwiGLU isolation target returned no tensor: {name}')
+            os.makedirs(self._swiglu_isolation_dir, exist_ok=True)
+            path = os.path.join(self._swiglu_isolation_dir, 'swiglu_fc1_output.pt')
+            torch.save({
+                'target': name,
+                'step': context['step'],
+                'micro_batch': context['micro_batch'],
+                'fc1_output': tensor.detach().contiguous().cpu(),
+            }, path)
+            self._swiglu_isolation_done = True
+            logger.info(f'Captured common SwiGLU input: {path}')
+
+        return hook
+
+    def _register_swiglu_isolation_hooks(self):
+        matched = []
+        for model in self.unwrapped_models:
+            for name, module in model.named_modules():
+                if name != self._swiglu_isolation_target:
+                    continue
+                handle = module.register_forward_hook(self._swiglu_isolation_hook(name))
+                self._swiglu_isolation_handles.append(handle)
+                matched.append(f'{name} ({type(module).__name__})')
+        if not matched:
+            raise ValueError(f'No SwiGLU isolation module matched: {self._swiglu_isolation_target}')
+        logger.info(f'GKD SwiGLU isolation hooks registered: {matched}')
 
     def _backward_debug_hook(self, model_idx, name):
 
@@ -1505,7 +1560,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         if debug_active and (
                 self._operator_debug_enabled
                 or self._linear_proj_isolation_mode
-                or self._flash_isolation_mode):
+                or self._flash_isolation_mode
+                or self._swiglu_isolation_mode):
             self._operator_debug_context = {
                 'step': step,
                 'micro_batch': micro_idx,
