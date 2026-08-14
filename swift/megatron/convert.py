@@ -98,7 +98,12 @@ def convert_mcore2hf(args: ExportArguments) -> None:
     if args.to_hf:
         bridge = mg_model.config.bridge
         logger.info('Converting weights and saving the model...')
-        bridge.save_weights([mg_model], args.output_dir, args=megatron_args, processor=processor)
+        bridge.save_weights(
+            [mg_model],
+            args.output_dir,
+            max_shard_size=megatron_args.max_shard_size,
+            args=megatron_args,
+            processor=processor)
         if is_master():
             if args.ckpt_dir:
                 args_path = os.path.join(args.ckpt_dir, 'args.json')

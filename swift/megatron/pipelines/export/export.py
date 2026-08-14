@@ -59,6 +59,7 @@ class MegatronExport(SwiftPipeline):
             [mg_model],
             args.output_dir,
             peft_format=save_peft_format,
+            max_shard_size=args.max_shard_size,
             args=args,
             processor=self.processor,
         )

@@ -781,6 +781,7 @@ class BaseMegatronTrainer(ABC):
                     self.unwrapped_models,
                     output_dir,
                     peft_format=args.tuner_type == 'lora',
+                    max_shard_size=args.max_shard_size,
                     args=args,
                     processor=self.template.processor,
                 )
@@ -802,6 +803,7 @@ class BaseMegatronTrainer(ABC):
                     self.unwrapped_models,
                     output_dir,
                     peft_format=False,
+                    max_shard_size=args.max_shard_size,
                     args=args,
                     processor=self.template.processor,
                 )
