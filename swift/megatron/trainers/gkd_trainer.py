@@ -699,6 +699,17 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             },
         }
 
+    @staticmethod
+    def _flash_comparable_metadata(metadata):
+        metadata = dict(metadata)
+        non_tensor_kwargs = dict(metadata.get('non_tensor_kwargs', {}))
+
+        # PackedSeqParams contains backend-specific devices and optional padded
+        # sequence tensors. Replay must keep the runtime backend's own object.
+        non_tensor_kwargs.pop('packed_seq_params', None)
+        metadata['non_tensor_kwargs'] = non_tensor_kwargs
+        return metadata
+
     def _flash_isolation_pre_hook(self, module, args, kwargs):
         context = self._operator_debug_context
         if context is None or (
@@ -739,10 +750,12 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         saved_tensors = payload['tensors']
         saved_metadata = payload['metadata']
         runtime_metadata = self._flash_call_metadata(args, kwargs)
-        if saved_metadata != runtime_metadata:
+        saved_comparable = self._flash_comparable_metadata(saved_metadata)
+        runtime_comparable = self._flash_comparable_metadata(runtime_metadata)
+        if saved_comparable != runtime_comparable:
             raise ValueError(
                 f'Flash Attention call metadata does not match the captured call. '
-                f'captured={saved_metadata}, runtime={runtime_metadata}')
+                f'captured={saved_comparable}, runtime={runtime_comparable}')
         runtime_by_location = {
             (item['location'], item['key']): item for item in runtime_tensors
         }
