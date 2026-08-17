@@ -139,6 +139,36 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             raise ValueError('SWIFT_GKD_JSD_ISOLATION_DIR is required for JSD isolation capture.')
         if self._jsd_isolation_step < 0 or self._jsd_isolation_micro_batch < 0:
             raise ValueError('JSD isolation step and micro-batch must be non-negative.')
+        self._dlogits_isolation_mode = os.getenv('SWIFT_GKD_DLOGITS_ISOLATION_MODE', '').lower()
+        self._dlogits_isolation_dir = os.getenv('SWIFT_GKD_DLOGITS_ISOLATION_DIR')
+        self._dlogits_isolation_step = int(os.getenv('SWIFT_GKD_DLOGITS_ISOLATION_STEP', '0'))
+        self._dlogits_isolation_micro_batch = int(os.getenv('SWIFT_GKD_DLOGITS_ISOLATION_MICRO_BATCH', '0'))
+        self._dlogits_isolation_tag = os.getenv('SWIFT_GKD_DLOGITS_ISOLATION_TAG', '').lower()
+        dlogits_patterns = os.getenv(
+            'SWIFT_GKD_DLOGITS_BACKWARD_PATTERNS',
+            'output_layer,decoder.layers.27,decoder.layers.2,decoder.layers.0')
+        self._dlogits_backward_patterns = [
+            pattern.strip() for pattern in dlogits_patterns.split(',') if pattern.strip()
+        ]
+        parameter_patterns = os.getenv(
+            'SWIFT_GKD_DLOGITS_PARAMETER_PATTERNS',
+            'output_layer.weight,decoder.layers.27.mlp.linear_fc2.weight,'
+            'decoder.layers.2.mlp.linear_fc2.weight,'
+            'decoder.layers.0.self_attention.linear_qkv.weight')
+        self._dlogits_parameter_patterns = [
+            pattern.strip() for pattern in parameter_patterns.split(',') if pattern.strip()
+        ]
+        self._dlogits_module_gradients = {}
+        self._dlogits_hook_done = False
+        if self._dlogits_isolation_mode not in {'', 'capture', 'replay'}:
+            raise ValueError('SWIFT_GKD_DLOGITS_ISOLATION_MODE must be empty, "capture", or "replay".')
+        if self._dlogits_isolation_mode and not self._dlogits_isolation_dir:
+            raise ValueError('SWIFT_GKD_DLOGITS_ISOLATION_DIR is required for dLogits isolation.')
+        if self._dlogits_isolation_step < 0 or self._dlogits_isolation_micro_batch < 0:
+            raise ValueError('dLogits isolation step and micro-batch must be non-negative.')
+        if self._dlogits_isolation_mode:
+            self._backward_debug_patterns = list(dict.fromkeys(
+                self._backward_debug_patterns + self._dlogits_backward_patterns))
         self._linear_proj_isolation_mode = os.getenv('SWIFT_GKD_LINEAR_PROJ_ISOLATION_MODE', '').lower()
         self._linear_proj_isolation_dir = os.getenv('SWIFT_GKD_LINEAR_PROJ_ISOLATION_DIR')
         self._linear_proj_isolation_target = os.getenv(
@@ -221,6 +251,11 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         if self._flash_isolation_mode and self._is_debug_rank():
             os.makedirs(self._flash_isolation_dir, exist_ok=True)
             logger.info(f'GKD Flash Attention isolation output directory ready: {self._flash_isolation_dir}')
+        if self._dlogits_isolation_mode and self._is_debug_rank():
+            os.makedirs(self._dlogits_isolation_dir, exist_ok=True)
+            logger.info(
+                f'GKD common dLogits isolation mode={self._dlogits_isolation_mode}, '
+                f'dir={self._dlogits_isolation_dir}')
 
         if self.use_teacher_api:
             if is_last_rank():
@@ -256,7 +291,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         # Hooks must be installed before training even when the debug window starts after step 0.
         if self._alignment_debug_steps > self._alignment_debug_start_step and self._operator_debug_enabled:
             self._register_operator_debug_hooks()
-        if self._alignment_debug_steps > self._alignment_debug_start_step and self._backward_debug_enabled:
+        if (self._alignment_debug_steps > self._alignment_debug_start_step
+                and (self._backward_debug_enabled or self._dlogits_isolation_mode)):
             self._register_backward_debug_hooks()
         if self._alignment_debug_active(0) and self._linear_proj_isolation_mode:
             self._register_linear_proj_isolation_hooks()
@@ -322,6 +358,58 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'dtype': str(tensor.dtype),
             'sha256': hashlib.sha256(value.numpy().tobytes()).hexdigest(),
         }
+
+    @property
+    def _dlogits_isolation_input_path(self):
+        return os.path.join(self._dlogits_isolation_dir, 'common_dlogits.pt')
+
+    @property
+    def _dlogits_isolation_output_path(self):
+        tag = self._dlogits_isolation_tag or 'result'
+        return os.path.join(self._dlogits_isolation_dir, f'full_backward_{tag}.pt')
+
+    def _is_dlogits_isolation_target(self, step, micro_batch):
+        return (
+            bool(self._dlogits_isolation_mode)
+            and step == self._dlogits_isolation_step
+            and micro_batch == self._dlogits_isolation_micro_batch
+        )
+
+    def _register_dlogits_isolation_hook(self, output_tensor, step, micro_batch):
+        if not self._is_dlogits_isolation_target(step, micro_batch) or self._dlogits_hook_done:
+            return
+        if not output_tensor.requires_grad:
+            raise ValueError('Common dLogits isolation requires differentiable student logits.')
+
+        common_gradient = None
+        if self._dlogits_isolation_mode == 'replay':
+            if not os.path.isfile(self._dlogits_isolation_input_path):
+                raise FileNotFoundError(f'Common dLogits not found: {self._dlogits_isolation_input_path}')
+            payload = torch.load(self._dlogits_isolation_input_path, map_location='cpu', weights_only=True)
+            common_gradient = payload['dlogits']
+            if tuple(common_gradient.shape) != tuple(output_tensor.shape):
+                raise ValueError(
+                    f'Common dLogits shape {tuple(common_gradient.shape)} does not match '
+                    f'student logits shape {tuple(output_tensor.shape)}.')
+
+        def hook(gradient):
+            if self._dlogits_isolation_mode == 'capture':
+                os.makedirs(self._dlogits_isolation_dir, exist_ok=True)
+                torch.save({
+                    'dlogits': gradient.detach().cpu(),
+                    'identity': self._tensor_identity(gradient),
+                    'step': step,
+                    'micro_batch': micro_batch,
+                }, self._dlogits_isolation_input_path)
+                logger.info(f'Captured common student dLogits: {self._dlogits_isolation_input_path}')
+                replacement = gradient
+            else:
+                replacement = common_gradient.to(device=gradient.device, dtype=gradient.dtype)
+                logger.info(f'Replaying common student dLogits: {self._dlogits_isolation_input_path}')
+            self._dlogits_hook_done = True
+            return replacement
+
+        output_tensor.register_hook(hook)
 
     def _logits_summary(self, logits, labels):
         if logits is None:
@@ -505,14 +593,27 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             if key in self._backward_debug_written:
                 return
             self._backward_debug_written.add(key)
+            input_gradient = self._first_tensor(grad_input)
+            output_gradient = self._first_tensor(grad_output)
+            if self._is_dlogits_isolation_target(context['step'], context['micro_batch']):
+                capture_key = f'model{model_idx}.{name}'
+                self._dlogits_module_gradients[capture_key] = {
+                    'module_type': type(module).__name__,
+                    'input_gradient': input_gradient.detach().cpu() if input_gradient is not None else None,
+                    # output_layer receives the full vocabulary-sized dLogits,
+                    # which is already stored once in common_dlogits.pt.
+                    'output_gradient': (
+                        None if name == 'output_layer' or output_gradient is None
+                        else output_gradient.detach().cpu()),
+                }
             self._write_alignment_record({
                 'record_type': 'module_backward',
                 'step': context['step'],
                 'micro_batch': context['micro_batch'],
                 'name': f'model{model_idx}.{name}',
                 'module_type': type(module).__name__,
-                'input_gradient': self._operator_tensor_summary(self._first_tensor(grad_input)),
-                'output_gradient': self._operator_tensor_summary(self._first_tensor(grad_output)),
+                'input_gradient': self._operator_tensor_summary(input_gradient),
+                'output_gradient': self._operator_tensor_summary(output_gradient),
             })
 
         return hook
@@ -530,6 +631,29 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             raise ValueError(
                 f'No backward debug module matched exact patterns: {self._backward_debug_patterns}')
         logger.info(f'GKD backward debug hooks registered: {matched}')
+
+    def _capture_dlogits_parameter_gradient_samples(self):
+        result = {}
+        for model_idx, model in enumerate(self.unwrapped_models):
+            for name, parameter in model.named_parameters():
+                if name not in self._dlogits_parameter_patterns:
+                    continue
+                gradient = getattr(parameter, 'main_grad', None)
+                if gradient is None:
+                    gradient = parameter.grad
+                if gradient is None:
+                    continue
+                indices = self._sample_parameter_indices(gradient.numel())
+                index_tensor = torch.tensor(indices, dtype=torch.int64, device=gradient.device)
+                sample = gradient.detach().reshape(-1).index_select(0, index_tensor).cpu()
+                result[f'model{model_idx}.{name}'] = {
+                    'full_shape': list(gradient.shape),
+                    'full_dtype': str(gradient.dtype),
+                    'full_numel': gradient.numel(),
+                    'sample_indices': indices,
+                    'sample': sample,
+                }
+        return result
 
     @property
     def _linear_proj_isolation_input_path(self):
@@ -1109,12 +1233,38 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
     def train_step(self, train_data_iterator):
         step = int(self.state.iteration)
         debug_active = self._alignment_debug_active(step)
+        if self._dlogits_isolation_mode and step == self._dlogits_isolation_step:
+            if self.args.num_microbatches != 1:
+                raise ValueError(
+                    'Common dLogits full-backward isolation requires exactly one micro-batch. '
+                    'Set global_batch_size equal to micro_batch_size for this diagnostic run.')
+            if not debug_active:
+                raise ValueError(
+                    'Common dLogits isolation target step must be inside the alignment debug window.')
         before = self._capture_trainable_tensors() if debug_active else None
         optimizer_before = (
             self._capture_optimizer_debug_state()
             if debug_active and self._backward_debug_enabled else None
         )
         result = super().train_step(train_data_iterator)
+        if self._dlogits_isolation_mode and step == self._dlogits_isolation_step:
+            if not self._dlogits_hook_done:
+                raise RuntimeError(
+                    'Common dLogits isolation completed without capturing or replaying the target gradient.')
+            torch.save({
+                'mode': self._dlogits_isolation_mode,
+                'tag': self._dlogits_isolation_tag,
+                'step': step,
+                'micro_batch': self._dlogits_isolation_micro_batch,
+                'common_dlogits': torch.load(
+                    self._dlogits_isolation_input_path,
+                    map_location='cpu',
+                    weights_only=True,
+                )['identity'],
+                'module_gradients': self._dlogits_module_gradients,
+                'parameter_gradient_samples': self._capture_dlogits_parameter_gradient_samples(),
+            }, self._dlogits_isolation_output_path)
+            logger.info(f'Saved common-dLogits full backward result: {self._dlogits_isolation_output_path}')
         if debug_active:
             _, grad_norm, update_successful = result
             learning_rate = next(
@@ -1673,6 +1823,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'Flash Attention isolation target forward completed without capture. '
                 f'target={self._flash_isolation_prefix}, step={step}, micro_batch={micro_idx}.')
 
+        self._register_dlogits_isolation_hook(student_output, step, micro_idx)
+
         self._capture_jsd_isolation_inputs(
             student_output, teacher_output, labels, step, micro_idx)
 
@@ -1707,7 +1859,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             )
 
             def debug_loss_callback(output_tensor):
-                if self._backward_debug_enabled:
+                if self._backward_debug_enabled or self._dlogits_isolation_mode:
                     self._backward_debug_context = {
                         'step': step,
                         'micro_batch': micro_idx,
