@@ -212,6 +212,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 logger.warning(
                     f'Reusing teacher logits from cache step {self._teacher_cache_reuse_step} for every step. '
                     'The input IDs and micro-batch order must repeat exactly.')
+        if self._flash_isolation_mode and self._is_debug_rank():
+            os.makedirs(self._flash_isolation_dir, exist_ok=True)
+            logger.info(f'GKD Flash Attention isolation output directory ready: {self._flash_isolation_dir}')
 
         if self.use_teacher_api:
             if is_last_rank():
@@ -1562,6 +1565,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         micro_idx = self._alignment_micro_counts.get(step, 0)
         self._alignment_micro_counts[step] = micro_idx + 1
         debug_active = self._alignment_debug_active(step)
+        if self._flash_isolation_mode and self._is_debug_rank():
+            logger.info(
+                f'GKD Flash Attention isolation forward context: step={step}, '
+                f'micro_batch={micro_idx}, debug_active={debug_active}')
         if debug_active:
             self._alignment_loss_context = {}
 
@@ -1581,6 +1588,13 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             student_output = model(**data)
         finally:
             self._operator_debug_context = None
+        if (self._flash_isolation_mode
+                and step == self._flash_isolation_step
+                and micro_idx == self._flash_isolation_micro_batch
+                and not self._flash_isolation_done):
+            raise RuntimeError(
+                'Flash Attention isolation target forward completed without capture. '
+                f'target={self._flash_isolation_prefix}, step={step}, micro_batch={micro_idx}.')
 
         self._capture_jsd_isolation_inputs(
             student_output, teacher_output, labels, step, micro_idx)
