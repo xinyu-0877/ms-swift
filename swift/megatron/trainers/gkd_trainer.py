@@ -789,9 +789,11 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         matched = []
         for model_idx, model in enumerate(self.unwrapped_models):
             for name, module in model.named_modules():
-                if not name.startswith(self._flash_isolation_prefix):
+                # GPU and NPU FlashAttention children expose different call APIs.
+                # Capture and replay at their common DotProductAttention parent.
+                if name != self._flash_isolation_prefix:
                     continue
-                if type(module).__name__ != 'FlashAttention':
+                if type(module).__name__ not in {'TEDotProductAttention', 'DotProductAttention'}:
                     continue
                 pre_handle = module.register_forward_pre_hook(
                     self._flash_isolation_pre_hook, with_kwargs=True)
@@ -801,7 +803,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 matched.append(f'model{model_idx}.{name} ({type(module).__name__})')
         if len(matched) != 1:
             raise ValueError(
-                f'Expected exactly one Flash Attention isolation target under '
+                f'Expected exactly one DotProductAttention isolation target at '
                 f'{self._flash_isolation_prefix}, found: {matched}')
         logger.info(f'GKD Flash Attention isolation mode={self._flash_isolation_mode}, targets={matched}')
 
