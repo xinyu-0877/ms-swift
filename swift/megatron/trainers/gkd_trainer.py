@@ -163,12 +163,18 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._flash_isolation_tag = os.getenv('SWIFT_GKD_FLASH_ISOLATION_TAG', '').lower()
         self._flash_isolation_step = int(os.getenv('SWIFT_GKD_FLASH_ISOLATION_STEP', '0'))
         self._flash_isolation_micro_batch = int(os.getenv('SWIFT_GKD_FLASH_ISOLATION_MICRO_BATCH', '0'))
+        self._flash_backward_isolation_enabled = os.getenv(
+            'SWIFT_GKD_FLASH_BACKWARD_ISOLATION', '0').lower() in {'1', 'true', 'yes'}
+        self._flash_backward_isolation_done = False
         self._flash_isolation_done = False
         self._flash_isolation_handles = []
         if self._flash_isolation_mode not in {'', 'capture', 'replay'}:
             raise ValueError('SWIFT_GKD_FLASH_ISOLATION_MODE must be empty, "capture", or "replay".')
         if self._flash_isolation_mode and not self._flash_isolation_dir:
             raise ValueError('SWIFT_GKD_FLASH_ISOLATION_DIR is required for Flash Attention isolation.')
+        if self._flash_backward_isolation_enabled and not self._flash_isolation_mode:
+            raise ValueError(
+                'SWIFT_GKD_FLASH_BACKWARD_ISOLATION requires Flash Attention capture or replay mode.')
         if self._flash_isolation_step < 0 or self._flash_isolation_micro_batch < 0:
             raise ValueError('Flash Attention isolation step and micro-batch must be non-negative.')
         self._swiglu_isolation_mode = os.getenv('SWIFT_GKD_SWIGLU_ISOLATION_MODE', '').lower()
@@ -675,6 +681,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         tag = self._flash_isolation_tag or tensor.device.type
         return os.path.join(self._flash_isolation_dir, f'flash_output_{tag}.pt')
 
+    def _flash_backward_isolation_output_path(self, tensor):
+        tag = self._flash_isolation_tag or tensor.device.type
+        return os.path.join(self._flash_isolation_dir, f'flash_backward_{tag}.pt')
+
     @staticmethod
     def _flash_direct_tensors(args, kwargs):
         tensors = []
@@ -710,6 +720,58 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         metadata['non_tensor_kwargs'] = non_tensor_kwargs
         return metadata
 
+    def _run_flash_backward_isolation(self, module, args, kwargs):
+        if not self._flash_backward_isolation_enabled or self._flash_backward_isolation_done:
+            return
+        if len(args) < 3 or not all(torch.is_tensor(args[index]) for index in range(3)):
+            raise ValueError('Flash backward isolation requires Q/K/V as the first three positional tensors.')
+
+        isolated_args = list(args)
+        qkv = []
+        for index in range(3):
+            value = args[index].detach().clone().requires_grad_(True)
+            isolated_args[index] = value
+            qkv.append(value)
+
+        # This direct call bypasses this module's hooks and avoids activation
+        # checkpoint recomputation changing the common Q/K/V used by the probe.
+        with torch.enable_grad():
+            isolated_output = module.forward(*isolated_args, **kwargs)
+            output_tensor = self._first_tensor(isolated_output)
+            if output_tensor is None or not output_tensor.requires_grad:
+                raise ValueError('Flash backward isolation did not produce a differentiable output tensor.')
+
+            # Generate the same flattened gradient on CPU. The backend-specific
+            # output layouts may differ while retaining the same element order.
+            common_dout = torch.linspace(
+                -1.0, 1.0, output_tensor.numel(), dtype=torch.float32, device='cpu')
+            common_dout = common_dout.to(dtype=output_tensor.dtype)
+            common_dout = common_dout.reshape(output_tensor.shape).to(device=output_tensor.device)
+            gradients = torch.autograd.grad(
+                outputs=output_tensor,
+                inputs=tuple(qkv),
+                grad_outputs=common_dout,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )
+
+        output_path = self._flash_backward_isolation_output_path(output_tensor)
+        torch.save({
+            'dq': gradients[0].detach().cpu(),
+            'dk': gradients[1].detach().cpu(),
+            'dv': gradients[2].detach().cpu(),
+            'qkv': [self._tensor_identity(value) for value in qkv],
+            'dout': self._tensor_identity(common_dout),
+            'output_shape': list(output_tensor.shape),
+            'output_dtype': str(output_tensor.dtype),
+            'mode': self._flash_isolation_mode,
+            'target_prefix': self._flash_isolation_prefix,
+            'module_type': type(module).__name__,
+        }, output_path)
+        self._flash_backward_isolation_done = True
+        logger.info(f'Saved isolated Flash Attention backward gradients: {output_path}')
+
     def _flash_isolation_pre_hook(self, module, args, kwargs):
         context = self._operator_debug_context
         if context is None or (
@@ -742,6 +804,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'module_type': type(module).__name__,
             }, self._flash_isolation_input_path)
             logger.info(f'Captured common Flash Attention inputs: {self._flash_isolation_input_path}')
+            self._run_flash_backward_isolation(module, args, kwargs)
             return args, kwargs
 
         if not os.path.isfile(self._flash_isolation_input_path):
@@ -776,6 +839,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 args[int(saved['key'])] = common
             else:
                 kwargs[saved['key']] = common
+        self._run_flash_backward_isolation(module, tuple(args), kwargs)
         logger.info(f'Replaying common Flash Attention inputs: {self._flash_isolation_input_path}')
         return tuple(args), kwargs
 
