@@ -132,6 +132,10 @@ def main():
             == common_parameter_identities),
         'common_dout_match': (
             gpu_dout_identities == npu_dout_identities == common_dout_identities),
+        'input_gradient_source_match': (
+            gpu.get('input_gradient_source')
+            == npu.get('input_gradient_source')
+            == 'module_full_backward_hook'),
         'forward_outputs': compare_tensor_maps(
             gpu.get('forward_outputs', {}), npu.get('forward_outputs', {})),
         'input_gradient': tensor_metrics(gpu['input_gradient'], npu['input_gradient']),
@@ -146,6 +150,7 @@ def main():
         'common_input_match',
         'common_parameters_match',
         'common_dout_match',
+        'input_gradient_source_match',
     )
     mismatches = [name for name in required_matches if not result[name]]
     if mismatches:

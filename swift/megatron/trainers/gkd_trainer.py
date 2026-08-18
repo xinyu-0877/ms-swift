@@ -854,15 +854,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'forward_outputs': {},
                 'used_output_gradients': {},
                 'input_gradient': None,
+                'input_gradient_source': None,
                 'parameter_gradients': {},
             }
-
-            def input_gradient_hook(gradient):
-                self._fc1_isolation_result['input_gradient'] = gradient.detach().cpu().contiguous()
-                return gradient
-
-            if isolated_input.requires_grad:
-                isolated_input.register_hook(input_gradient_hook)
             return args, kwargs
 
         return hook
@@ -926,6 +920,22 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         return hook
 
+    def _fc1_isolation_backward_hook(self, name):
+
+        def hook(module, grad_input, grad_output):
+            context = self._fc1_isolation_context()
+            if context is None:
+                return
+            input_gradient = self._first_tensor(grad_input)
+            if input_gradient is None:
+                raise RuntimeError(f'FC1 isolation target returned no local input gradient: {name}')
+            if self._fc1_isolation_result is None:
+                raise RuntimeError('FC1 isolation backward hook ran before its forward hooks.')
+            self._fc1_isolation_result['input_gradient'] = input_gradient.detach().cpu().contiguous()
+            self._fc1_isolation_result['input_gradient_source'] = 'module_full_backward_hook'
+
+        return hook
+
     def _register_fc1_isolation_hooks(self):
         matched = []
         for model in self.unwrapped_models:
@@ -936,7 +946,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     self._fc1_isolation_pre_hook(name), with_kwargs=True)
                 output_handle = module.register_forward_hook(
                     self._fc1_isolation_forward_hook(name), with_kwargs=True)
-                self._fc1_isolation_handles.extend([pre_handle, output_handle])
+                backward_handle = module.register_full_backward_hook(
+                    self._fc1_isolation_backward_hook(name))
+                self._fc1_isolation_handles.extend([pre_handle, output_handle, backward_handle])
                 matched.append(f'{name} ({type(module).__name__}, {inspect.signature(module.forward)})')
         if not matched:
             raise ValueError(f'FC1 isolation target not found: {self._fc1_isolation_target}')
