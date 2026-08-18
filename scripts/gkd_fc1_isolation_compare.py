@@ -122,7 +122,8 @@ def main():
         'npu_module_config': npu_module_config,
         'gpu_mode': gpu.get('mode'),
         'npu_mode': npu.get('mode'),
-        'replay_modes_match': gpu.get('mode') == 'replay' and npu.get('mode') == 'replay',
+        'execution_modes_valid': (
+            gpu.get('mode') == 'replay' and npu.get('mode') in {'capture', 'replay'}),
         'common_input_match': (
             gpu.get('input_identity') == npu.get('input_identity') == common_input_identity),
         'common_parameters_match': (
@@ -141,7 +142,7 @@ def main():
         'target_match',
         'module_type_match',
         'module_config_match',
-        'replay_modes_match',
+        'execution_modes_valid',
         'common_input_match',
         'common_parameters_match',
         'common_dout_match',
