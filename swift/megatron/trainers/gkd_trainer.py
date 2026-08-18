@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import hashlib
+import inspect
 import json
 import os
 import random
@@ -227,6 +228,27 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             raise ValueError('SWIFT_GKD_SWIGLU_ISOLATION_DIR is required for SwiGLU isolation.')
         if self._swiglu_isolation_step < 0 or self._swiglu_isolation_micro_batch < 0:
             raise ValueError('SwiGLU isolation step and micro-batch must be non-negative.')
+        self._fc1_isolation_mode = os.getenv('SWIFT_GKD_FC1_ISOLATION_MODE', '').lower()
+        self._fc1_isolation_dir = os.getenv('SWIFT_GKD_FC1_ISOLATION_DIR')
+        self._fc1_isolation_target = os.getenv(
+            'SWIFT_GKD_FC1_ISOLATION_TARGET',
+            'decoder.layers.27.mlp.linear_fc1')
+        self._fc1_isolation_step = int(os.getenv('SWIFT_GKD_FC1_ISOLATION_STEP', '0'))
+        self._fc1_isolation_micro_batch = int(os.getenv('SWIFT_GKD_FC1_ISOLATION_MICRO_BATCH', '0'))
+        self._fc1_isolation_tag = os.getenv('SWIFT_GKD_FC1_ISOLATION_TAG', '').lower()
+        self._fc1_isolation_handles = []
+        self._fc1_isolation_module = None
+        self._fc1_isolation_common = None
+        self._fc1_isolation_result = None
+        self._fc1_isolation_expected_output_gradients = set()
+        self._fc1_isolation_seen_output_gradients = set()
+        self._fc1_isolation_forward_done = False
+        if self._fc1_isolation_mode not in {'', 'capture', 'replay'}:
+            raise ValueError('SWIFT_GKD_FC1_ISOLATION_MODE must be empty, "capture", or "replay".')
+        if self._fc1_isolation_mode and not self._fc1_isolation_dir:
+            raise ValueError('SWIFT_GKD_FC1_ISOLATION_DIR is required for FC1 isolation.')
+        if self._fc1_isolation_step < 0 or self._fc1_isolation_micro_batch < 0:
+            raise ValueError('FC1 isolation step and micro-batch must be non-negative.')
         self._teacher_cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
         self._teacher_cache_dir = os.getenv('SWIFT_GKD_TEACHER_CACHE_DIR')
         reuse_step = os.getenv('SWIFT_GKD_TEACHER_CACHE_REUSE_STEP')
@@ -261,6 +283,11 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             logger.info(
                 f'GKD common dLogits isolation mode={self._dlogits_isolation_mode}, '
                 f'dir={self._dlogits_isolation_dir}')
+        if self._fc1_isolation_mode and self._is_debug_rank():
+            os.makedirs(self._fc1_isolation_dir, exist_ok=True)
+            logger.info(
+                f'GKD FC1 isolation mode={self._fc1_isolation_mode}, '
+                f'target={self._fc1_isolation_target}, dir={self._fc1_isolation_dir}')
 
         if self.use_teacher_api:
             if is_last_rank():
@@ -305,6 +332,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             self._register_flash_isolation_hooks()
         if self._swiglu_isolation_mode:
             self._register_swiglu_isolation_hooks()
+        if self._fc1_isolation_mode:
+            self._register_fc1_isolation_hooks()
 
     @property
     def _alignment_debug_path(self):
@@ -628,6 +657,257 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             raise ValueError(f'No SwiGLU dout module matched: {self._swiglu_isolation_dout_target}')
         logger.info(
             f'GKD SwiGLU isolation hooks registered: input={input_matched}, dout={dout_matched}')
+
+    @property
+    def _fc1_isolation_common_path(self):
+        return os.path.join(self._fc1_isolation_dir, 'fc1_module_common.pt')
+
+    @property
+    def _fc1_isolation_result_path(self):
+        tag = self._fc1_isolation_tag or self._fc1_isolation_mode
+        return os.path.join(self._fc1_isolation_dir, f'fc1_module_{tag}.pt')
+
+    def _is_fc1_isolation_target(self, context):
+        return (
+            context is not None
+            and context['step'] == self._fc1_isolation_step
+            and context['micro_batch'] == self._fc1_isolation_micro_batch
+        )
+
+    def _fc1_isolation_context(self):
+        if self._is_fc1_isolation_target(self._operator_debug_context):
+            return self._operator_debug_context
+        if self._is_fc1_isolation_target(self._backward_debug_context):
+            return self._backward_debug_context
+        return None
+
+    @staticmethod
+    def _named_tensor_leaves(value, prefix='output'):
+        if torch.is_tensor(value):
+            return [(prefix, value)]
+        if isinstance(value, dict):
+            result = []
+            for key, item in value.items():
+                result.extend(MegatronGKDTrainer._named_tensor_leaves(item, f'{prefix}.{key}'))
+            return result
+        if isinstance(value, (tuple, list)):
+            result = []
+            for index, item in enumerate(value):
+                result.extend(MegatronGKDTrainer._named_tensor_leaves(item, f'{prefix}.{index}'))
+            return result
+        return []
+
+    @staticmethod
+    def _fc1_isolation_module_config(module):
+        result = {}
+        attribute_names = (
+            'eps',
+            'epsilon',
+            'layernorm_epsilon',
+            'layer_norm_epsilon',
+            'normalization',
+            'zero_centered_gamma',
+        )
+        for prefix, source in (('module', module), ('config', getattr(module, 'config', None))):
+            if source is None:
+                continue
+            for name in attribute_names:
+                value = getattr(source, name, None)
+                if isinstance(value, (bool, int, float, str)):
+                    result[f'{prefix}.{name}'] = value
+        return result
+
+    def _load_fc1_isolation_common(self):
+        if self._fc1_isolation_common is None:
+            if not os.path.isfile(self._fc1_isolation_common_path):
+                raise FileNotFoundError(
+                    f'Common FC1 isolation payload not found: {self._fc1_isolation_common_path}')
+            self._fc1_isolation_common = torch.load(
+                self._fc1_isolation_common_path, map_location='cpu', weights_only=True)
+        return self._fc1_isolation_common
+
+    def _fc1_isolation_pre_hook(self, name):
+
+        def hook(module, args, kwargs):
+            context = self._fc1_isolation_context()
+            if context is None:
+                return args, kwargs
+            input_tensor = self._first_tensor(args)
+            if input_tensor is None:
+                input_tensor = self._first_tensor(kwargs)
+            if input_tensor is None:
+                raise RuntimeError(f'FC1 isolation target received no tensor input: {name}')
+
+            runtime_parameters = dict(module.named_parameters())
+            module_type = type(module).__name__
+            module_signature = str(inspect.signature(module.forward))
+            module_config = self._fc1_isolation_module_config(module)
+            if self._fc1_isolation_mode == 'capture':
+                if self._fc1_isolation_common is None:
+                    self._fc1_isolation_common = {
+                        'target': name,
+                        'module_type': module_type,
+                        'module_signature': module_signature,
+                        'module_config': module_config,
+                        'step': context['step'],
+                        'micro_batch': context['micro_batch'],
+                        'input': input_tensor.detach().cpu().contiguous(),
+                        'parameters': {
+                            key: value.detach().cpu().contiguous()
+                            for key, value in runtime_parameters.items()
+                        },
+                        'output_gradients': {},
+                    }
+                isolated_input = input_tensor
+            else:
+                common = self._load_fc1_isolation_common()
+                if common.get('target') != name:
+                    raise ValueError(
+                        f'Common FC1 target {common.get("target")} does not match runtime target {name}.')
+                if common.get('module_type') != module_type:
+                    raise ValueError(
+                        f'Common FC1 module type {common.get("module_type")} does not match '
+                        f'runtime type {module_type}.')
+                if common.get('module_config', {}) != module_config:
+                    raise ValueError(
+                        f'Common FC1 module config {common.get("module_config", {})} does not match '
+                        f'runtime config {module_config}.')
+                common_input = common['input']
+                if tuple(common_input.shape) != tuple(input_tensor.shape):
+                    raise ValueError(
+                        f'Common FC1 input shape {tuple(common_input.shape)} does not match '
+                        f'runtime shape {tuple(input_tensor.shape)}.')
+                common_parameters = common.get('parameters', {})
+                if set(common_parameters) != set(runtime_parameters):
+                    raise ValueError(
+                        f'FC1 parameter names differ: common={sorted(common_parameters)}, '
+                        f'runtime={sorted(runtime_parameters)}.')
+                with torch.no_grad():
+                    for key, parameter in runtime_parameters.items():
+                        common_parameter = common_parameters[key]
+                        if tuple(common_parameter.shape) != tuple(parameter.shape):
+                            raise ValueError(
+                                f'FC1 parameter {key} shape {tuple(common_parameter.shape)} does not match '
+                                f'runtime shape {tuple(parameter.shape)}.')
+                        parameter.copy_(common_parameter.to(device=parameter.device, dtype=parameter.dtype))
+                isolated_input = common_input.to(
+                    device=input_tensor.device, dtype=input_tensor.dtype).detach().requires_grad_(True)
+                args, kwargs = self._replace_first_tensor(args, kwargs, isolated_input)
+
+            self._fc1_isolation_module = module
+            self._fc1_isolation_result = {
+                'mode': self._fc1_isolation_mode,
+                'tag': self._fc1_isolation_tag,
+                'target': name,
+                'module_type': module_type,
+                'module_signature': module_signature,
+                'module_config': module_config,
+                'step': context['step'],
+                'micro_batch': context['micro_batch'],
+                'input_identity': self._tensor_identity(isolated_input),
+                'parameter_identities': {
+                    key: self._tensor_identity(value)
+                    for key, value in runtime_parameters.items()
+                },
+                'forward_outputs': {},
+                'used_output_gradients': {},
+                'input_gradient': None,
+                'parameter_gradients': {},
+            }
+
+            def input_gradient_hook(gradient):
+                self._fc1_isolation_result['input_gradient'] = gradient.detach().cpu().contiguous()
+                return gradient
+
+            if isolated_input.requires_grad:
+                isolated_input.register_hook(input_gradient_hook)
+            return args, kwargs
+
+        return hook
+
+    def _fc1_isolation_forward_hook(self, name):
+
+        def hook(module, args, kwargs, output):
+            context = self._fc1_isolation_context()
+            if context is None:
+                return
+            leaves = self._named_tensor_leaves(output)
+            if not leaves:
+                raise RuntimeError(f'FC1 isolation target returned no tensor output: {name}')
+            result = self._fc1_isolation_result
+            if result is None:
+                raise RuntimeError('FC1 isolation forward hook ran before its pre-hook.')
+            result['forward_outputs'] = {
+                path: tensor.detach().cpu().contiguous() for path, tensor in leaves
+            }
+            grad_leaves = {path: tensor for path, tensor in leaves if tensor.requires_grad}
+            # Reentrant activation checkpointing runs the original forward under no_grad
+            # and creates the differentiable outputs during backward recomputation.
+            if not grad_leaves:
+                self._fc1_isolation_forward_done = True
+                return
+            if self._fc1_isolation_mode == 'capture':
+                expected = set(grad_leaves)
+            else:
+                expected = set(self._load_fc1_isolation_common().get('output_gradient_paths', []))
+                if not expected.issubset(grad_leaves):
+                    raise ValueError(
+                        f'FC1 common differentiable outputs are missing at runtime: common={sorted(expected)}, '
+                        f'runtime={sorted(grad_leaves)}.')
+            self._fc1_isolation_expected_output_gradients = expected
+
+            for path, tensor in grad_leaves.items():
+
+                def output_gradient_hook(gradient, output_path=path):
+                    if self._fc1_isolation_mode == 'capture':
+                        replacement = gradient
+                        self._fc1_isolation_common['output_gradients'][output_path] = (
+                            gradient.detach().cpu().contiguous())
+                    else:
+                        if output_path not in expected:
+                            raise RuntimeError(
+                                f'FC1 runtime output {output_path} received a gradient but was unused '
+                                'during common NPU capture.')
+                        common_gradient = self._load_fc1_isolation_common()['output_gradients'][output_path]
+                        if tuple(common_gradient.shape) != tuple(gradient.shape):
+                            raise ValueError(
+                                f'Common FC1 dout {output_path} shape {tuple(common_gradient.shape)} '
+                                f'does not match runtime shape {tuple(gradient.shape)}.')
+                        replacement = common_gradient.to(device=gradient.device, dtype=gradient.dtype)
+                    self._fc1_isolation_result['used_output_gradients'][output_path] = (
+                        replacement.detach().cpu().contiguous())
+                    self._fc1_isolation_seen_output_gradients.add(output_path)
+                    return replacement
+
+                tensor.register_hook(output_gradient_hook)
+            self._fc1_isolation_forward_done = True
+
+        return hook
+
+    def _register_fc1_isolation_hooks(self):
+        matched = []
+        for model in self.unwrapped_models:
+            for name, module in model.named_modules():
+                if name != self._fc1_isolation_target:
+                    continue
+                pre_handle = module.register_forward_pre_hook(
+                    self._fc1_isolation_pre_hook(name), with_kwargs=True)
+                output_handle = module.register_forward_hook(
+                    self._fc1_isolation_forward_hook(name), with_kwargs=True)
+                self._fc1_isolation_handles.extend([pre_handle, output_handle])
+                matched.append(f'{name} ({type(module).__name__}, {inspect.signature(module.forward)})')
+        if not matched:
+            raise ValueError(f'FC1 isolation target not found: {self._fc1_isolation_target}')
+        logger.info(f'GKD FC1 isolation hooks registered: {matched}')
+
+    def _capture_fc1_isolation_parameter_gradients(self):
+        result = {}
+        for name, parameter in self._fc1_isolation_module.named_parameters():
+            gradient = getattr(parameter, 'main_grad', None)
+            if gradient is None:
+                gradient = parameter.grad
+            result[name] = gradient.detach().cpu().contiguous() if gradient is not None else None
+        return result
 
     def _backward_debug_hook(self, model_idx, name):
 
@@ -1287,6 +1567,13 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             if not debug_active:
                 raise ValueError(
                     'Common dLogits isolation target step must be inside the alignment debug window.')
+        if self._fc1_isolation_mode and step == self._fc1_isolation_step:
+            if self.args.num_microbatches != 1:
+                raise ValueError(
+                    'FC1 isolation requires exactly one micro-batch. '
+                    'Set global_batch_size equal to micro_batch_size for this diagnostic run.')
+            if not debug_active:
+                raise ValueError('FC1 isolation target step must be inside the alignment debug window.')
         before = self._capture_trainable_tensors() if debug_active else None
         optimizer_before = (
             self._capture_optimizer_debug_state()
@@ -1297,6 +1584,30 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             if not self._swiglu_isolation_done:
                 raise RuntimeError(
                     'SwiGLU backward isolation completed without capturing both fc1 output and fc2 input gradient.')
+        if self._fc1_isolation_mode and step == self._fc1_isolation_step:
+            if not self._fc1_isolation_forward_done or self._fc1_isolation_result is None:
+                raise RuntimeError('FC1 isolation target did not run at the selected step and micro-batch.')
+            if not self._fc1_isolation_seen_output_gradients:
+                raise RuntimeError('FC1 isolation did not observe any output gradient.')
+            if (self._fc1_isolation_mode == 'replay'
+                    and self._fc1_isolation_expected_output_gradients
+                    != self._fc1_isolation_seen_output_gradients):
+                raise RuntimeError(
+                    'FC1 isolation did not observe every output gradient: '
+                    f'expected={sorted(self._fc1_isolation_expected_output_gradients)}, '
+                    f'seen={sorted(self._fc1_isolation_seen_output_gradients)}.')
+            if self._fc1_isolation_result.get('input_gradient') is None:
+                raise RuntimeError('FC1 isolation did not capture dInput.')
+            self._fc1_isolation_result['parameter_gradients'] = (
+                self._capture_fc1_isolation_parameter_gradients())
+            if self._fc1_isolation_mode == 'capture':
+                captured_paths = set(self._fc1_isolation_common.get('output_gradients', {}))
+                self._fc1_isolation_expected_output_gradients = captured_paths
+                self._fc1_isolation_common['output_gradient_paths'] = sorted(captured_paths)
+                torch.save(self._fc1_isolation_common, self._fc1_isolation_common_path)
+                logger.info(f'Saved common FC1 isolation payload: {self._fc1_isolation_common_path}')
+            torch.save(self._fc1_isolation_result, self._fc1_isolation_result_path)
+            logger.info(f'Saved FC1 isolation result: {self._fc1_isolation_result_path}')
         if self._dlogits_isolation_mode and step == self._dlogits_isolation_step:
             if not self._dlogits_hook_done:
                 raise RuntimeError(
@@ -1855,7 +2166,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 self._operator_debug_enabled
                 or self._linear_proj_isolation_mode
                 or self._flash_isolation_mode
-                or self._swiglu_isolation_mode):
+                or self._swiglu_isolation_mode
+                or self._fc1_isolation_mode):
             self._operator_debug_context = {
                 'step': step,
                 'micro_batch': micro_idx,
@@ -1911,7 +2223,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             def debug_loss_callback(output_tensor):
                 if (self._backward_debug_enabled
                         or self._dlogits_isolation_mode
-                        or self._swiglu_isolation_mode):
+                        or self._swiglu_isolation_mode
+                        or self._fc1_isolation_mode):
                     self._backward_debug_context = {
                         'step': step,
                         'micro_batch': micro_idx,
