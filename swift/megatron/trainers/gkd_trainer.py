@@ -698,8 +698,43 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         return []
 
     @staticmethod
-    def _fc1_isolation_module_config(module):
+    def _normalize_fc1_isolation_module_config(config):
+        aliases = {
+            'epsilon': (
+                'epsilon',
+                'module.eps',
+                'module.epsilon',
+                'module.layernorm_epsilon',
+                'module.layer_norm_epsilon',
+                'config.eps',
+                'config.epsilon',
+                'config.layernorm_epsilon',
+                'config.layer_norm_epsilon',
+            ),
+            'normalization': (
+                'normalization',
+                'module.normalization',
+                'config.normalization',
+            ),
+            'zero_centered_gamma': (
+                'zero_centered_gamma',
+                'module.zero_centered_gamma',
+                'config.zero_centered_gamma',
+                'config.layernorm_zero_centered_gamma',
+            ),
+        }
         result = {}
+        for canonical_name, candidate_names in aliases.items():
+            for candidate_name in candidate_names:
+                value = config.get(candidate_name)
+                if isinstance(value, (bool, int, float, str)):
+                    result[canonical_name] = value
+                    break
+        return result
+
+    @classmethod
+    def _fc1_isolation_module_config(cls, module):
+        raw_config = {}
         attribute_names = (
             'eps',
             'epsilon',
@@ -707,6 +742,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'layer_norm_epsilon',
             'normalization',
             'zero_centered_gamma',
+            'layernorm_zero_centered_gamma',
         )
         for prefix, source in (('module', module), ('config', getattr(module, 'config', None))):
             if source is None:
@@ -714,8 +750,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             for name in attribute_names:
                 value = getattr(source, name, None)
                 if isinstance(value, (bool, int, float, str)):
-                    result[f'{prefix}.{name}'] = value
-        return result
+                    raw_config[f'{prefix}.{name}'] = value
+        return cls._normalize_fc1_isolation_module_config(raw_config)
 
     def _load_fc1_isolation_common(self):
         if self._fc1_isolation_common is None:
@@ -768,10 +804,16 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     raise ValueError(
                         f'Common FC1 module type {common.get("module_type")} does not match '
                         f'runtime type {module_type}.')
-                if common.get('module_config', {}) != module_config:
+                common_module_config = self._normalize_fc1_isolation_module_config(
+                    common.get('module_config', {}))
+                mismatched_config = {
+                    key: {'common': value, 'runtime': module_config.get(key)}
+                    for key, value in common_module_config.items()
+                    if module_config.get(key) != value
+                }
+                if mismatched_config:
                     raise ValueError(
-                        f'Common FC1 module config {common.get("module_config", {})} does not match '
-                        f'runtime config {module_config}.')
+                        f'Common FC1 module config does not match runtime config: {mismatched_config}.')
                 common_input = common['input']
                 if tuple(common_input.shape) != tuple(input_tensor.shape):
                     raise ValueError(

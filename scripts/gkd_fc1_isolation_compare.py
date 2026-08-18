@@ -66,6 +66,27 @@ def identities(values):
     return {name: tensor_identity(value) for name, value in values.items()}
 
 
+def normalize_module_config(config):
+    aliases = {
+        'epsilon': (
+            'epsilon', 'module.eps', 'module.epsilon', 'module.layernorm_epsilon',
+            'module.layer_norm_epsilon', 'config.eps', 'config.epsilon',
+            'config.layernorm_epsilon', 'config.layer_norm_epsilon'),
+        'normalization': ('normalization', 'module.normalization', 'config.normalization'),
+        'zero_centered_gamma': (
+            'zero_centered_gamma', 'module.zero_centered_gamma',
+            'config.zero_centered_gamma', 'config.layernorm_zero_centered_gamma'),
+    }
+    result = {}
+    for canonical_name, candidate_names in aliases.items():
+        for candidate_name in candidate_names:
+            value = config.get(candidate_name)
+            if isinstance(value, (bool, int, float, str)):
+                result[canonical_name] = value
+                break
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Compare GPU/NPU LayerNorm+linear_fc1 isolation replay results.')
@@ -83,14 +104,22 @@ def main():
     common_dout_identities = identities(common.get('output_gradients', {}))
     gpu_dout_identities = identities(gpu.get('used_output_gradients', {}))
     npu_dout_identities = identities(npu.get('used_output_gradients', {}))
+    common_module_config = normalize_module_config(common.get('module_config', {}))
+    gpu_module_config = normalize_module_config(gpu.get('module_config', {}))
+    npu_module_config = normalize_module_config(npu.get('module_config', {}))
+    common_module_config_match = all(
+        gpu_module_config.get(name) == npu_module_config.get(name) == value
+        for name, value in common_module_config.items())
 
     result = {
         'target_match': gpu.get('target') == npu.get('target') == common.get('target'),
         'module_type_match': (
             gpu.get('module_type') == npu.get('module_type') == common.get('module_type')),
         'module_signature_match': gpu.get('module_signature') == npu.get('module_signature'),
-        'module_config_match': (
-            gpu.get('module_config') == npu.get('module_config') == common.get('module_config')),
+        'module_config_match': common_module_config_match,
+        'common_module_config': common_module_config,
+        'gpu_module_config': gpu_module_config,
+        'npu_module_config': npu_module_config,
         'gpu_mode': gpu.get('mode'),
         'npu_mode': npu.get('mode'),
         'replay_modes_match': gpu.get('mode') == 'replay' and npu.get('mode') == 'replay',
