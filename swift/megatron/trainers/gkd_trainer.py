@@ -212,8 +212,13 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._swiglu_isolation_target = os.getenv(
             'SWIFT_GKD_SWIGLU_ISOLATION_TARGET',
             'decoder.layers.2.mlp.linear_fc1')
+        default_swiglu_dout_target = self._swiglu_isolation_target.replace('linear_fc1', 'linear_fc2')
+        self._swiglu_isolation_dout_target = os.getenv(
+            'SWIFT_GKD_SWIGLU_ISOLATION_DOUT_TARGET', default_swiglu_dout_target)
         self._swiglu_isolation_step = int(os.getenv('SWIFT_GKD_SWIGLU_ISOLATION_STEP', '0'))
         self._swiglu_isolation_micro_batch = int(os.getenv('SWIFT_GKD_SWIGLU_ISOLATION_MICRO_BATCH', '0'))
+        self._swiglu_isolation_input_captured = False
+        self._swiglu_isolation_payload = None
         self._swiglu_isolation_done = False
         self._swiglu_isolation_handles = []
         if self._swiglu_isolation_mode not in {'', 'capture'}:
@@ -545,11 +550,15 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 matched.append(f'model{model_idx}.{name} ({type(module).__name__})')
         logger.info(f'GKD operator debug hooks registered: {matched}')
 
-    def _swiglu_isolation_hook(self, name):
+    @property
+    def _swiglu_isolation_path(self):
+        return os.path.join(self._swiglu_isolation_dir, 'swiglu_fc1_output.pt')
+
+    def _swiglu_isolation_forward_hook(self, name):
 
         def hook(module, inputs, output):
             context = self._operator_debug_context
-            if context is None or self._swiglu_isolation_done:
+            if context is None or self._swiglu_isolation_input_captured:
                 return
             if (context['step'] != self._swiglu_isolation_step
                     or context['micro_batch'] != self._swiglu_isolation_micro_batch):
@@ -557,31 +566,68 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             tensor = self._first_tensor(output)
             if tensor is None:
                 raise RuntimeError(f'SwiGLU isolation target returned no tensor: {name}')
+            bias = None
+            if isinstance(output, (tuple, list)) and len(output) > 1 and torch.is_tensor(output[1]):
+                bias = output[1]
             os.makedirs(self._swiglu_isolation_dir, exist_ok=True)
-            path = os.path.join(self._swiglu_isolation_dir, 'swiglu_fc1_output.pt')
-            torch.save({
+            self._swiglu_isolation_payload = {
                 'target': name,
+                'dout_target': self._swiglu_isolation_dout_target,
                 'step': context['step'],
                 'micro_batch': context['micro_batch'],
                 'fc1_output': tensor.detach().contiguous().cpu(),
-            }, path)
+                'fc1_bias': bias.detach().contiguous().cpu() if bias is not None else None,
+            }
+            torch.save(self._swiglu_isolation_payload, self._swiglu_isolation_path)
+            self._swiglu_isolation_input_captured = True
+            logger.info(f'Captured common SwiGLU input: {self._swiglu_isolation_path}')
+
+        return hook
+
+    def _swiglu_isolation_backward_hook(self, name):
+
+        def hook(module, grad_input, grad_output):
+            context = self._backward_debug_context
+            if context is None or self._swiglu_isolation_done:
+                return
+            if (context['step'] != self._swiglu_isolation_step
+                    or context['micro_batch'] != self._swiglu_isolation_micro_batch):
+                return
+            if not self._swiglu_isolation_input_captured or self._swiglu_isolation_payload is None:
+                raise RuntimeError('SwiGLU backward isolation did not capture linear_fc1 output first.')
+            gradient = self._first_tensor(grad_input)
+            if gradient is None:
+                raise RuntimeError(f'SwiGLU dout target returned no input gradient: {name}')
+            payload = dict(self._swiglu_isolation_payload)
+            payload.update({
+                'dout_target': name,
+                'swiglu_dout': gradient.detach().contiguous().cpu(),
+            })
+            torch.save(payload, self._swiglu_isolation_path)
             self._swiglu_isolation_done = True
-            logger.info(f'Captured common SwiGLU input: {path}')
+            logger.info(f'Captured common SwiGLU input and dout: {self._swiglu_isolation_path}')
 
         return hook
 
     def _register_swiglu_isolation_hooks(self):
-        matched = []
+        input_matched = []
+        dout_matched = []
         for model in self.unwrapped_models:
             for name, module in model.named_modules():
-                if name != self._swiglu_isolation_target:
-                    continue
-                handle = module.register_forward_hook(self._swiglu_isolation_hook(name))
-                self._swiglu_isolation_handles.append(handle)
-                matched.append(f'{name} ({type(module).__name__})')
-        if not matched:
+                if name == self._swiglu_isolation_target:
+                    handle = module.register_forward_hook(self._swiglu_isolation_forward_hook(name))
+                    self._swiglu_isolation_handles.append(handle)
+                    input_matched.append(f'{name} ({type(module).__name__})')
+                if name == self._swiglu_isolation_dout_target:
+                    handle = module.register_full_backward_hook(self._swiglu_isolation_backward_hook(name))
+                    self._swiglu_isolation_handles.append(handle)
+                    dout_matched.append(f'{name} ({type(module).__name__})')
+        if not input_matched:
             raise ValueError(f'No SwiGLU isolation module matched: {self._swiglu_isolation_target}')
-        logger.info(f'GKD SwiGLU isolation hooks registered: {matched}')
+        if not dout_matched:
+            raise ValueError(f'No SwiGLU dout module matched: {self._swiglu_isolation_dout_target}')
+        logger.info(
+            f'GKD SwiGLU isolation hooks registered: input={input_matched}, dout={dout_matched}')
 
     def _backward_debug_hook(self, model_idx, name):
 
@@ -1247,6 +1293,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             if debug_active and self._backward_debug_enabled else None
         )
         result = super().train_step(train_data_iterator)
+        if self._swiglu_isolation_mode and step == self._swiglu_isolation_step:
+            if not self._swiglu_isolation_done:
+                raise RuntimeError(
+                    'SwiGLU backward isolation completed without capturing both fc1 output and fc2 input gradient.')
         if self._dlogits_isolation_mode and step == self._dlogits_isolation_step:
             if not self._dlogits_hook_done:
                 raise RuntimeError(
@@ -1859,7 +1909,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             )
 
             def debug_loss_callback(output_tensor):
-                if self._backward_debug_enabled or self._dlogits_isolation_mode:
+                if (self._backward_debug_enabled
+                        or self._dlogits_isolation_mode
+                        or self._swiglu_isolation_mode):
                     self._backward_debug_context = {
                         'step': step,
                         'micro_batch': micro_idx,
