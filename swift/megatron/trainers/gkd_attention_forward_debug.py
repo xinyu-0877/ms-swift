@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import re
 
 import torch
 
@@ -10,13 +11,15 @@ logger = get_logger()
 
 
 class GKDAttentionForwardTrace:
-    """Capture full Layer-N attention forward boundaries A-E."""
+    """Capture full-tensor decoder-layer outputs or Layer-N boundaries A-G."""
 
     def __init__(self, trainer):
         self.trainer = trainer
         self.enabled = os.getenv(
             'SWIFT_GKD_ATTENTION_FORWARD_TRACE', '0').lower() in {'1', 'true', 'yes'}
         self.output_dir = os.getenv('SWIFT_GKD_ATTENTION_FORWARD_DIR')
+        self.scope = os.getenv(
+            'SWIFT_GKD_ATTENTION_FORWARD_SCOPE', 'layer').lower()
         self.layer_target = os.getenv(
             'SWIFT_GKD_ATTENTION_FORWARD_LAYER_TARGET', 'decoder.layers.27')
         self.step = int(os.getenv('SWIFT_GKD_ATTENTION_FORWARD_STEP', '0'))
@@ -26,18 +29,25 @@ class GKDAttentionForwardTrace:
         self.payload = None
         self._captured_nodes = set()
 
-        self.node_targets = {
-            'A_layer_input': self.layer_target,
-            'B_linear_qkv_output': f'{self.layer_target}.self_attention.linear_qkv',
-            'C_core_attention_output': f'{self.layer_target}.self_attention.core_attention',
-            'D_linear_proj_output': f'{self.layer_target}.self_attention.linear_proj',
-            'E_pre_mlp_input': f'{self.layer_target}.mlp',
-        }
+        self.node_targets = {}
+        if self.scope == 'layer':
+            self.node_targets = {
+                'A_layer_input': self.layer_target,
+                'B_linear_qkv_output': f'{self.layer_target}.self_attention.linear_qkv',
+                'C_core_attention_output': f'{self.layer_target}.self_attention.core_attention',
+                'D_linear_proj_output': f'{self.layer_target}.self_attention.linear_proj',
+                'E_pre_mlp_input': f'{self.layer_target}.mlp',
+                'F_mlp_output': f'{self.layer_target}.mlp',
+                'G_layer_output': self.layer_target,
+            }
         if not self.enabled:
             return
         if not self.output_dir:
             raise ValueError(
                 'SWIFT_GKD_ATTENTION_FORWARD_DIR is required when attention forward trace is enabled.')
+        if self.scope not in {'layer', 'layers'}:
+            raise ValueError(
+                'SWIFT_GKD_ATTENTION_FORWARD_SCOPE must be "layer" or "layers".')
         if self.step < 0 or self.micro_batch < 0:
             raise ValueError('Attention forward trace step and micro-batch must be non-negative.')
         if not self.tag or not self.tag.replace('_', '').replace('-', '').isalnum():
@@ -107,6 +117,7 @@ class GKDAttentionForwardTrace:
                 'tag': self.tag,
                 'step': self.step,
                 'micro_batch': self.micro_batch,
+                'scope': self.scope,
                 'layer_target': self.layer_target,
                 'node_targets': dict(self.node_targets),
                 'module_types': {},
@@ -148,21 +159,26 @@ class GKDAttentionForwardTrace:
         return hook
 
     def register_hooks(self):
+        if self.scope == 'layers':
+            return self._register_layer_scan_hooks()
         matched = {node: [] for node in self.node_targets}
-        target_to_node = {target: node for node, target in self.node_targets.items()}
+        target_to_nodes = {}
+        for node, target in self.node_targets.items():
+            target_to_nodes.setdefault(target, []).append(node)
         for model in self.trainer.unwrapped_models:
             for name, module in model.named_modules():
-                node = target_to_node.get(name)
-                if node is None:
+                nodes = target_to_nodes.get(name)
+                if nodes is None:
                     continue
-                if node in {'A_layer_input', 'E_pre_mlp_input'}:
-                    handle = module.register_forward_pre_hook(
-                        self._pre_hook(node), with_kwargs=True)
-                else:
-                    handle = module.register_forward_hook(
-                        self._forward_hook(node), with_kwargs=True)
-                self.handles.append(handle)
-                matched[node].append(f'{name} ({type(module).__name__})')
+                for node in nodes:
+                    if node in {'A_layer_input', 'E_pre_mlp_input'}:
+                        handle = module.register_forward_pre_hook(
+                            self._pre_hook(node), with_kwargs=True)
+                    else:
+                        handle = module.register_forward_hook(
+                            self._forward_hook(node), with_kwargs=True)
+                    self.handles.append(handle)
+                    matched[node].append(f'{name} ({type(module).__name__})')
         missing = [node for node, modules in matched.items() if not modules]
         if missing:
             raise ValueError(
@@ -170,6 +186,32 @@ class GKDAttentionForwardTrace:
         os.makedirs(self.output_dir, exist_ok=True)
         logger.info(
             f'GKD attention forward trace enabled: layer={self.layer_target}, '
+            f'output={self.output_path}, matched={matched}')
+
+    def _register_layer_scan_hooks(self):
+        matched = []
+        for model in self.trainer.unwrapped_models:
+            for name, module in model.named_modules():
+                match = re.fullmatch(r'decoder\.layers\.(\d+)', name)
+                if match is None:
+                    continue
+                layer_index = int(match.group(1))
+                input_node = f'L{layer_index:02d}_input'
+                output_node = f'L{layer_index:02d}_output'
+                self.node_targets[input_node] = name
+                self.node_targets[output_node] = name
+                self.handles.extend([
+                    module.register_forward_pre_hook(
+                        self._pre_hook(input_node), with_kwargs=True),
+                    module.register_forward_hook(
+                        self._forward_hook(output_node), with_kwargs=True),
+                ])
+                matched.append(f'{name} ({type(module).__name__})')
+        if not matched:
+            raise ValueError('Attention forward layer scan found no decoder.layers.N modules.')
+        os.makedirs(self.output_dir, exist_ok=True)
+        logger.info(
+            f'GKD full layer forward scan enabled: layers={len(matched)}, '
             f'output={self.output_path}, matched={matched}')
 
     def prepare_train_step(self, step, debug_active, num_microbatches):

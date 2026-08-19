@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Source before the existing one-step training command:
-# source scripts/gkd_attention_forward_env.sh DIR TAG
+# source scripts/gkd_attention_forward_env.sh DIR TAG [SCOPE] [LAYER_TARGET]
 
 _gkd_attention_dir=${1:-}
 _gkd_attention_tag=${2:-}
+_gkd_attention_scope=${3:-layer}
+_gkd_attention_layer=${4:-decoder.layers.27}
 
 if [[ -z "${_gkd_attention_dir}" || -z "${_gkd_attention_tag}" ]]; then
     echo 'gkd_attention_forward_env.sh: DIR and TAG are required' >&2
@@ -27,8 +29,9 @@ export SWIFT_GKD_BACKWARD_DEBUG=0
 export SWIFT_GKD_ATTENTION_FORWARD_TRACE=1
 export SWIFT_GKD_ATTENTION_FORWARD_DIR="${_gkd_attention_dir}"
 export SWIFT_GKD_ATTENTION_FORWARD_TAG="${_gkd_attention_tag}"
-export SWIFT_GKD_ATTENTION_FORWARD_LAYER_TARGET=decoder.layers.27
+export SWIFT_GKD_ATTENTION_FORWARD_SCOPE="${_gkd_attention_scope}"
+export SWIFT_GKD_ATTENTION_FORWARD_LAYER_TARGET="${_gkd_attention_layer}"
 export SWIFT_GKD_ATTENTION_FORWARD_STEP=0
 export SWIFT_GKD_ATTENTION_FORWARD_MICRO_BATCH=0
 
-unset _gkd_attention_dir _gkd_attention_tag
+unset _gkd_attention_dir _gkd_attention_tag _gkd_attention_scope _gkd_attention_layer

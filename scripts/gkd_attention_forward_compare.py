@@ -6,12 +6,14 @@ from pathlib import Path
 import torch
 
 
-NODE_ORDER = (
+LAYER_NODE_ORDER = (
     'A_layer_input',
     'B_linear_qkv_output',
     'C_core_attention_output',
     'D_linear_proj_output',
     'E_pre_mlp_input',
+    'F_mlp_output',
+    'G_layer_output',
 )
 
 
@@ -77,19 +79,21 @@ def primary_tensor(node_values, reference_numel, node):
     return candidates[0]
 
 
-def linear_proj_closure(payload):
+def residual_closure(payload, input_node, output_node, branch_node):
     nodes = payload['nodes']
-    layer_input = only_tensor(nodes['A_layer_input'], 'A_layer_input').float()
-    pre_mlp = only_tensor(nodes['E_pre_mlp_input'], 'E_pre_mlp_input').float()
-    inferred_branch = pre_mlp - layer_input
-    proj_values = nodes['D_linear_proj_output']
+    residual_input = only_tensor(nodes[input_node], input_node).float()
+    _, residual_output = primary_tensor(
+        nodes[output_node], residual_input.numel(), output_node)
+    residual_output = residual_output.float().reshape_as(residual_input)
+    inferred_branch = residual_output - residual_input
+    branch_values = nodes[branch_node]
     primary_path, primary = primary_tensor(
-        proj_values, inferred_branch.numel(), 'D_linear_proj_output')
+        branch_values, inferred_branch.numel(), branch_node)
     primary = primary.float().reshape_as(inferred_branch)
     candidate = primary
     bias_path = None
     bias_candidates = [
-        (path, tensor) for path, tensor in proj_values.items()
+        (path, tensor) for path, tensor in branch_values.items()
         if path != primary_path and tensor.numel() == inferred_branch.shape[-1]
     ]
     if len(bias_candidates) == 1:
@@ -97,8 +101,8 @@ def linear_proj_closure(payload):
         candidate = candidate + bias.float().reshape(
             *((1,) * (inferred_branch.ndim - 1)), inferred_branch.shape[-1])
     return {
-        'inferred_attention_branch': inferred_branch,
-        'linear_proj_candidate': candidate,
+        'inferred_branch': inferred_branch,
+        'branch_candidate': candidate,
         'primary_path': primary_path,
         'bias_path': bias_path,
     }
@@ -116,28 +120,31 @@ def main():
     npu = torch.load(args.npu, map_location='cpu', weights_only=True)
     gpu_nodes = gpu.get('nodes', {})
     npu_nodes = npu.get('nodes', {})
+    scope = gpu.get('scope', 'layer')
     invariants = {
+        'scope_match': scope == npu.get('scope', 'layer'),
         'layer_target_match': gpu.get('layer_target') == npu.get('layer_target'),
         'node_targets_match': gpu.get('node_targets') == npu.get('node_targets'),
         'step_match': gpu.get('step') == npu.get('step'),
         'micro_batch_match': gpu.get('micro_batch') == npu.get('micro_batch'),
-        'all_nodes_present': set(gpu_nodes) == set(npu_nodes) == set(NODE_ORDER),
+        'all_nodes_present': set(gpu_nodes) == set(npu_nodes),
     }
     failed = [name for name, value in invariants.items() if not value]
     if failed:
         raise ValueError(f'Attention forward trace invariants failed: {failed}')
 
-    nodes = {
-        node: compare_maps(gpu_nodes[node], npu_nodes[node])
-        for node in NODE_ORDER
-    }
-    gpu_closure = linear_proj_closure(gpu)
-    npu_closure = linear_proj_closure(npu)
-    branch_metrics = tensor_metrics(
-        gpu_closure['inferred_attention_branch'],
-        npu_closure['inferred_attention_branch'])
+    if scope == 'layer' and set(gpu_nodes) != set(LAYER_NODE_ORDER):
+        raise ValueError(
+            f'Layer trace nodes differ: expected={list(LAYER_NODE_ORDER)}, '
+            f'actual={sorted(gpu_nodes)}')
+    if scope == 'layers' and not gpu_nodes:
+        raise ValueError('Layer scan contains no nodes.')
+
+    node_order = LAYER_NODE_ORDER if scope == 'layer' else sorted(gpu_nodes)
+    nodes = {node: compare_maps(gpu_nodes[node], npu_nodes[node]) for node in node_order}
     result = {
         'invariants': invariants,
+        'scope': scope,
         'gpu_tag': gpu.get('tag'),
         'npu_tag': npu.get('tag'),
         'module_types': {
@@ -145,20 +152,45 @@ def main():
             'npu': npu.get('module_types', {}),
         },
         'nodes': nodes,
-        'attention_branch_inferred_as_E_minus_A': branch_metrics,
-        'forward_residual_closure': {
-            'gpu_linear_proj_candidate_vs_E_minus_A': tensor_metrics(
-                gpu_closure['linear_proj_candidate'],
-                gpu_closure['inferred_attention_branch']),
-            'npu_linear_proj_candidate_vs_E_minus_A': tensor_metrics(
-                npu_closure['linear_proj_candidate'],
-                npu_closure['inferred_attention_branch']),
-            'gpu_primary_path': gpu_closure['primary_path'],
-            'npu_primary_path': npu_closure['primary_path'],
-            'gpu_bias_path': gpu_closure['bias_path'],
-            'npu_bias_path': npu_closure['bias_path'],
-        },
     }
+    if scope == 'layer':
+        closures = {}
+        for name, input_node, output_node, branch_node in (
+                ('attention', 'A_layer_input', 'E_pre_mlp_input', 'D_linear_proj_output'),
+                ('mlp', 'E_pre_mlp_input', 'G_layer_output', 'F_mlp_output')):
+            gpu_closure = residual_closure(gpu, input_node, output_node, branch_node)
+            npu_closure = residual_closure(npu, input_node, output_node, branch_node)
+            closures[name] = {
+                'inferred_branch_gpu_vs_npu': tensor_metrics(
+                    gpu_closure['inferred_branch'], npu_closure['inferred_branch']),
+                'gpu_branch_candidate_vs_inferred': tensor_metrics(
+                    gpu_closure['branch_candidate'], gpu_closure['inferred_branch']),
+                'npu_branch_candidate_vs_inferred': tensor_metrics(
+                    npu_closure['branch_candidate'], npu_closure['inferred_branch']),
+                'gpu_primary_path': gpu_closure['primary_path'],
+                'npu_primary_path': npu_closure['primary_path'],
+                'gpu_bias_path': gpu_closure['bias_path'],
+                'npu_bias_path': npu_closure['bias_path'],
+            }
+        result['residual_closures'] = closures
+    else:
+        layer_summary = {}
+        for node in node_order:
+            candidates = [
+                (path, metrics) for path, metrics in nodes[node].items()
+                if 'numel' in metrics
+            ]
+            if not candidates:
+                continue
+            path, metrics = max(candidates, key=lambda item: item[1]['numel'])
+            layer_summary[node] = {
+                'primary_path': path,
+                'relative_l2': metrics['relative_l2'],
+                'cosine': metrics['cosine'],
+                'gpu_norm': metrics['gpu_norm'],
+                'npu_norm': metrics['npu_norm'],
+            }
+        result['layer_summary'] = layer_summary
     output_text = json.dumps(result, ensure_ascii=False, indent=2)
     print(output_text)
     if args.output:
