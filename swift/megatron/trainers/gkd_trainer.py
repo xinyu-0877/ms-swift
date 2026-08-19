@@ -26,6 +26,7 @@ from swift.rlhf_trainers.vllm_client import VLLMInferClient
 from swift.template import Template
 from swift.utils import get_cu_seqlens_from_position_ids, get_logger, is_last_rank, to_device
 from ..utils import forward_step_helper, get_padding_to
+from .gkd_attention_forward_debug import GKDAttentionForwardTrace
 from .gkd_utils import cp_reduce, tp_gather_topk, vocab_parallel_topk
 from .gkd_mlp_merge_debug import GKDMLPMergeIsolation
 from .rlhf_mixin import MegatronRLHFTrainer
@@ -251,6 +252,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         if self._fc1_isolation_step < 0 or self._fc1_isolation_micro_batch < 0:
             raise ValueError('FC1 isolation step and micro-batch must be non-negative.')
         self._mlp_merge_isolation = GKDMLPMergeIsolation(self)
+        self._attention_forward_trace = GKDAttentionForwardTrace(self)
         self._teacher_cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
         self._teacher_cache_dir = os.getenv('SWIFT_GKD_TEACHER_CACHE_DIR')
         reuse_step = os.getenv('SWIFT_GKD_TEACHER_CACHE_REUSE_STEP')
@@ -338,6 +340,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             self._register_fc1_isolation_hooks()
         if self._mlp_merge_isolation.enabled:
             self._mlp_merge_isolation.register_hooks()
+        if self._attention_forward_trace.enabled:
+            self._attention_forward_trace.register_hooks()
 
     @property
     def _alignment_debug_path(self):
@@ -1634,6 +1638,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 raise ValueError('FC1 isolation target step must be inside the alignment debug window.')
         self._mlp_merge_isolation.prepare_train_step(
             step, debug_active, self.args.num_microbatches)
+        self._attention_forward_trace.prepare_train_step(
+            step, debug_active, self.args.num_microbatches)
         before = self._capture_trainable_tensors() if debug_active else None
         optimizer_before = (
             self._capture_optimizer_debug_state()
@@ -1669,6 +1675,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             torch.save(self._fc1_isolation_result, self._fc1_isolation_result_path)
             logger.info(f'Saved FC1 isolation result: {self._fc1_isolation_result_path}')
         self._mlp_merge_isolation.finalize_train_step(step)
+        self._attention_forward_trace.finalize_train_step(step)
         if self._dlogits_isolation_mode and step == self._dlogits_isolation_step:
             if not self._dlogits_hook_done:
                 raise RuntimeError(
@@ -2229,7 +2236,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 or self._flash_isolation_mode
                 or self._swiglu_isolation_mode
                 or self._fc1_isolation_mode
-                or self._mlp_merge_isolation.enabled):
+                or self._mlp_merge_isolation.enabled
+                or self._attention_forward_trace.enabled):
             self._operator_debug_context = {
                 'step': step,
                 'micro_batch': micro_idx,
