@@ -8,7 +8,11 @@ import torch
 
 LAYER_NODE_ORDER = (
     'A_layer_input',
-    'B_linear_qkv_output',
+    'B0_linear_qkv_output',
+    'B1_query_before_qk_norm',
+    'B1_key_before_qk_norm',
+    'B2_query_after_qk_norm',
+    'B2_key_after_qk_norm',
     'C0_core_attention_input_qkv',
     'C_core_attention_output',
     'D_linear_proj_output',
@@ -159,6 +163,17 @@ def main():
         result['core_attention_input_qkv_summary'] = {
             path.removeprefix('tensor.'): metrics
             for path, metrics in qkv_node.items()
+        }
+        result['qkv_pipeline_summary'] = {
+            'combined_linear_qkv': nodes['B0_linear_qkv_output'],
+            'query_before_qk_norm': nodes['B1_query_before_qk_norm'],
+            'key_before_qk_norm': nodes['B1_key_before_qk_norm'],
+            'query_after_qk_norm': nodes['B2_query_after_qk_norm'],
+            'key_after_qk_norm': nodes['B2_key_after_qk_norm'],
+            'core_attention_input_qkv': result['core_attention_input_qkv_summary'],
+            'value_note': (
+                'core_attention input value is the runtime value after QKV split/reshape; '
+                'Q/K norm and RoPE do not transform value.'),
         }
         closures = {}
         for name, input_node, output_node, branch_node in (

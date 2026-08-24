@@ -34,7 +34,11 @@ class GKDAttentionForwardTrace:
         if self.scope == 'layer':
             self.node_targets = {
                 'A_layer_input': self.layer_target,
-                'B_linear_qkv_output': f'{self.layer_target}.self_attention.linear_qkv',
+                'B0_linear_qkv_output': f'{self.layer_target}.self_attention.linear_qkv',
+                'B1_query_before_qk_norm': f'{self.layer_target}.self_attention.q_layernorm',
+                'B1_key_before_qk_norm': f'{self.layer_target}.self_attention.k_layernorm',
+                'B2_query_after_qk_norm': f'{self.layer_target}.self_attention.q_layernorm',
+                'B2_key_after_qk_norm': f'{self.layer_target}.self_attention.k_layernorm',
                 'C0_core_attention_input_qkv': f'{self.layer_target}.self_attention.core_attention',
                 'C_core_attention_output': f'{self.layer_target}.self_attention.core_attention',
                 'D_linear_proj_output': f'{self.layer_target}.self_attention.linear_proj',
@@ -218,7 +222,12 @@ class GKDAttentionForwardTrace:
                     if node == 'C0_core_attention_input_qkv':
                         handle = module.register_forward_pre_hook(
                             self._core_attention_pre_hook(node), with_kwargs=True)
-                    elif node in {'A_layer_input', 'E_pre_mlp_input'}:
+                    elif node in {
+                            'A_layer_input',
+                            'B1_query_before_qk_norm',
+                            'B1_key_before_qk_norm',
+                            'E_pre_mlp_input',
+                    }:
                         handle = module.register_forward_pre_hook(
                             self._pre_hook(node), with_kwargs=True)
                     else:
