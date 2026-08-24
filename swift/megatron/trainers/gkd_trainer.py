@@ -90,6 +90,18 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'decoder.layers.2.mlp.linear_fc2.weight',
             ]
         self._alignment_micro_counts = {}
+        self._grad_clip_debug_dir = os.getenv('SWIFT_GKD_GRAD_CLIP_DEBUG_DIR')
+        self._grad_clip_debug_tag = os.getenv('SWIFT_GKD_GRAD_CLIP_DEBUG_TAG', '').strip()
+        self._grad_clip_debug_start_step = int(os.getenv('SWIFT_GKD_GRAD_CLIP_DEBUG_START_STEP', '0'))
+        self._grad_clip_debug_steps = int(os.getenv('SWIFT_GKD_GRAD_CLIP_DEBUG_STEPS', '0'))
+        if self._grad_clip_debug_start_step < 0:
+            raise ValueError('SWIFT_GKD_GRAD_CLIP_DEBUG_START_STEP must be non-negative.')
+        if self._grad_clip_debug_steps < self._grad_clip_debug_start_step:
+            raise ValueError(
+                'SWIFT_GKD_GRAD_CLIP_DEBUG_STEPS must be greater than or equal to '
+                'SWIFT_GKD_GRAD_CLIP_DEBUG_START_STEP.')
+        if self._grad_clip_debug_steps > 0 and not self._grad_clip_debug_dir:
+            self._grad_clip_debug_dir = os.path.join(args.output_dir, 'gkd_grad_clip_debug')
         self._operator_debug_enabled = os.getenv(
             'SWIFT_GKD_OPERATOR_DEBUG', '0').lower() in {'1', 'true', 'yes'}
         self._operator_debug_layer_io = os.getenv(
@@ -272,6 +284,12 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             logger.info(
                 f'GKD alignment debug step range: '
                 f'[{self._alignment_debug_start_step}, {self._alignment_debug_steps})')
+        if self._grad_clip_debug_steps > 0 and self._is_debug_rank():
+            os.makedirs(self._grad_clip_debug_dir, exist_ok=True)
+            logger.info(f'GKD gradient clipping debug output: {self._grad_clip_debug_path}')
+            logger.info(
+                f'GKD gradient clipping debug step range: '
+                f'[{self._grad_clip_debug_start_step}, {self._grad_clip_debug_steps})')
         if self._teacher_cache_mode and self._is_debug_rank():
             os.makedirs(self._teacher_cache_dir, exist_ok=True)
             logger.info(f'GKD teacher cache mode={self._teacher_cache_mode}, dir={self._teacher_cache_dir}')
@@ -347,6 +365,11 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
     def _alignment_debug_path(self):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         return os.path.join(self._alignment_debug_dir, f'rank{rank}_alignment.jsonl')
+
+    @property
+    def _grad_clip_debug_path(self):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        return os.path.join(self._grad_clip_debug_dir, f'rank{rank}_grad_clip.jsonl')
 
     @staticmethod
     def _is_debug_rank():
@@ -481,6 +504,42 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             return
         os.makedirs(self._alignment_debug_dir, exist_ok=True)
         with open(self._alignment_debug_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + '\n')
+
+    def _grad_clip_debug_active(self, step):
+        return self._grad_clip_debug_start_step <= step < self._grad_clip_debug_steps
+
+    def _write_grad_clip_record(self, step, grad_norm, update_successful):
+        if not self._is_debug_rank():
+            return
+        clip_grad = float(self.args.clip_grad)
+        grad_norm = float(grad_norm) if grad_norm is not None else None
+        clipping_enabled = clip_grad > 0.0
+        clipped = clipping_enabled and grad_norm is not None and grad_norm > clip_grad
+        clip_coefficient = None
+        if clipping_enabled and grad_norm is not None:
+            clip_coefficient = min(1.0, clip_grad / (grad_norm + 1e-6))
+        config_clip_grads = []
+        for optimizer in self._optimizer_objects(self.optimizer):
+            config = getattr(optimizer, 'config', None)
+            value = getattr(config, 'clip_grad', None)
+            if value is not None:
+                config_clip_grads.append(float(value))
+        record = {
+            'record_type': 'grad_clip_step',
+            'tag': self._grad_clip_debug_tag,
+            'step': step,
+            'optimizer_reported_grad_norm': grad_norm,
+            'clip_grad': clip_grad,
+            'optimizer_config_clip_grads': sorted(set(config_clip_grads)),
+            'clipping_enabled': clipping_enabled,
+            'clipped': clipped,
+            'clip_coefficient': clip_coefficient,
+            'update_successful': bool(update_successful),
+            'norm_semantics': 'optimizer.step return; expected pre-clip total norm',
+        }
+        os.makedirs(self._grad_clip_debug_dir, exist_ok=True)
+        with open(self._grad_clip_debug_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + '\n')
 
     def _capture_jsd_isolation_inputs(self, student_logits, teacher_output, labels, step, micro_batch):
@@ -1646,6 +1705,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             if debug_active and self._backward_debug_enabled else None
         )
         result = super().train_step(train_data_iterator)
+        if self._grad_clip_debug_active(step):
+            _, grad_norm, update_successful = result
+            self._write_grad_clip_record(step, grad_norm, update_successful)
         if self._swiglu_isolation_mode and step == self._swiglu_isolation_step:
             if not self._swiglu_isolation_done:
                 raise RuntimeError(
