@@ -28,6 +28,21 @@ def tensor_metrics(first_tensor, reference_tensor):
     first_norm = torch.linalg.vector_norm(first)
     reference_norm = torch.linalg.vector_norm(reference)
     difference_norm = torch.linalg.vector_norm(difference)
+    if difference.numel():
+        max_abs_flat_index = int(difference.abs().argmax().item())
+        remaining = max_abs_flat_index
+        max_abs_coordinate = []
+        for size in reversed(first_tensor.shape):
+            max_abs_coordinate.append(remaining % size)
+            remaining //= size
+        max_abs_coordinate.reverse()
+        first_at_max_abs = first[max_abs_flat_index].item()
+        reference_at_max_abs = reference[max_abs_flat_index].item()
+    else:
+        max_abs_flat_index = None
+        max_abs_coordinate = None
+        first_at_max_abs = None
+        reference_at_max_abs = None
     epsilon = torch.finfo(torch.float64).eps
     if first_norm.item() == 0.0 and reference_norm.item() == 0.0:
         cosine = 1.0
@@ -38,6 +53,10 @@ def tensor_metrics(first_tensor, reference_tensor):
         'shape': list(first_tensor.shape),
         'numel': first.numel(),
         'max_abs': difference.abs().max().item() if difference.numel() else 0.0,
+        'max_abs_flat_index': max_abs_flat_index,
+        'max_abs_coordinate': max_abs_coordinate,
+        'first_at_max_abs': first_at_max_abs,
+        'reference_at_max_abs': reference_at_max_abs,
         'mean_abs': difference.abs().mean().item() if difference.numel() else 0.0,
         'absolute_l2': difference_norm.item(),
         'relative_l2': difference_norm.item() / max(reference_norm.item(), epsilon),
@@ -61,6 +80,13 @@ def tensor_map_metrics(first, reference):
     for name in sorted(set(first) | set(reference)):
         result[name] = optional_metrics(first.get(name), reference.get(name))
     return result
+
+
+def validate_checks(checks, description):
+    failed = [name for name, value in checks.items() if not value]
+    if failed:
+        raise ValueError(f'{description} invariants failed: {failed}')
+    return checks
 
 
 def tensor_summary(tensor):
@@ -120,10 +146,7 @@ def validate_capture(gpu, npu):
             == npu.get('mlp_local_input_gradient_source')
             == 'fc1_module_full_backward_hook'),
     }
-    failed = [name for name, value in checks.items() if not value]
-    if failed:
-        raise ValueError(f'MLP merge capture invariants failed: {failed}')
-    return checks
+    return validate_checks(checks, 'MLP merge capture')
 
 
 def validate_replay_sources(payload, x_capture, dout_capture, parameter_capture):
@@ -150,6 +173,9 @@ def main():
         description='Analyze Layer-N MLP residual merge captures and optional four-way MLP replays.')
     parser.add_argument('--gpu-capture', required=True)
     parser.add_argument('--npu-capture', required=True)
+    parser.add_argument(
+        '--common-npu-replay',
+        help='GPU replay using NPU input, output gradient, and parameters.')
     parser.add_argument('--x-npu-dy-npu')
     parser.add_argument('--x-gpu-dy-npu')
     parser.add_argument('--x-npu-dy-gpu')
@@ -163,6 +189,8 @@ def main():
         'capture_invariants': validate_capture(gpu, npu),
         'native_gpu_vs_npu': {
             'mlp_input_x': tensor_metrics(gpu['input'], npu['input']),
+            'mlp_forward_outputs': tensor_map_metrics(
+                gpu['forward_outputs'], npu['forward_outputs']),
             'layer_output_gradient_residual_branch': tensor_metrics(
                 gpu['layer_output_gradient'], npu['layer_output_gradient']),
             'mlp_output_gradients': tensor_map_metrics(
@@ -177,6 +205,18 @@ def main():
             'npu': merge_closure(npu),
         },
     }
+
+    if args.common_npu_replay:
+        replay = load_payload(args.common_npu_replay)
+        checks = validate_replay_sources(replay, npu, npu, npu)
+        validate_checks(checks, 'Common-NPU replay source')
+        result['common_npu_replay'] = {
+            'invariants': checks,
+            'gpu_vs_npu_forward_outputs': tensor_map_metrics(
+                replay['forward_outputs'], npu['forward_outputs']),
+            'gpu_vs_npu_local_input_gradient': tensor_metrics(
+                replay['mlp_local_input_gradient'], npu['mlp_local_input_gradient']),
+        }
 
     replay_paths = {
         'x_npu_dy_npu': args.x_npu_dy_npu,
