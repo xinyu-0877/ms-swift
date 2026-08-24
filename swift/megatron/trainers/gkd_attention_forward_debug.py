@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import inspect
 import os
 import re
 
@@ -11,7 +12,7 @@ logger = get_logger()
 
 
 class GKDAttentionForwardTrace:
-    """Capture full-tensor decoder-layer outputs or Layer-N boundaries A-G."""
+    """Capture decoder-layer outputs or Layer-N boundaries, including core-attention Q/K/V."""
 
     def __init__(self, trainer):
         self.trainer = trainer
@@ -34,6 +35,7 @@ class GKDAttentionForwardTrace:
             self.node_targets = {
                 'A_layer_input': self.layer_target,
                 'B_linear_qkv_output': f'{self.layer_target}.self_attention.linear_qkv',
+                'C0_core_attention_input_qkv': f'{self.layer_target}.self_attention.core_attention',
                 'C_core_attention_output': f'{self.layer_target}.self_attention.core_attention',
                 'D_linear_proj_output': f'{self.layer_target}.self_attention.linear_proj',
                 'E_pre_mlp_input': f'{self.layer_target}.mlp',
@@ -151,6 +153,48 @@ class GKDAttentionForwardTrace:
 
         return hook
 
+    @staticmethod
+    def _core_attention_qkv(module, args, kwargs):
+        arguments = dict(kwargs)
+        try:
+            bound = inspect.signature(module.forward).bind_partial(*args, **kwargs).arguments
+            arguments.update(bound)
+            if isinstance(bound.get('kwargs'), dict):
+                arguments.update(bound['kwargs'])
+        except (TypeError, ValueError):
+            pass
+        aliases = {
+            'query': ('query', 'query_layer', 'q'),
+            'key': ('key', 'key_layer', 'k'),
+            'value': ('value', 'value_layer', 'v'),
+        }
+        qkv = {}
+        for output_name, names in aliases.items():
+            for name in names:
+                value = arguments.get(name)
+                if torch.is_tensor(value):
+                    qkv[output_name] = value
+                    break
+        if len(qkv) == 3:
+            return qkv
+
+        positional_tensors = [value for value in args if torch.is_tensor(value)]
+        if len(positional_tensors) >= 3:
+            return dict(zip(('query', 'key', 'value'), positional_tensors[:3]))
+        raise RuntimeError(
+            'Attention forward trace could not identify query/key/value at the core-attention input: '
+            f'signature={inspect.signature(module.forward)}, argument_names={list(arguments)}')
+
+    def _core_attention_pre_hook(self, node):
+
+        def hook(module, args, kwargs):
+            if not self._context_matches() or node in self._captured_nodes:
+                return args, kwargs
+            self._capture(node, module, self._core_attention_qkv(module, args, kwargs))
+            return args, kwargs
+
+        return hook
+
     def _forward_hook(self, node):
 
         def hook(module, args, kwargs, output):
@@ -171,7 +215,10 @@ class GKDAttentionForwardTrace:
                 if nodes is None:
                     continue
                 for node in nodes:
-                    if node in {'A_layer_input', 'E_pre_mlp_input'}:
+                    if node == 'C0_core_attention_input_qkv':
+                        handle = module.register_forward_pre_hook(
+                            self._core_attention_pre_hook(node), with_kwargs=True)
+                    elif node in {'A_layer_input', 'E_pre_mlp_input'}:
                         handle = module.register_forward_pre_hook(
                             self._pre_hook(node), with_kwargs=True)
                     else:

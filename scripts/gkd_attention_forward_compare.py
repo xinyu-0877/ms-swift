@@ -9,6 +9,7 @@ import torch
 LAYER_NODE_ORDER = (
     'A_layer_input',
     'B_linear_qkv_output',
+    'C0_core_attention_input_qkv',
     'C_core_attention_output',
     'D_linear_proj_output',
     'E_pre_mlp_input',
@@ -154,6 +155,11 @@ def main():
         'nodes': nodes,
     }
     if scope == 'layer':
+        qkv_node = nodes['C0_core_attention_input_qkv']
+        result['core_attention_input_qkv_summary'] = {
+            path.removeprefix('tensor.'): metrics
+            for path, metrics in qkv_node.items()
+        }
         closures = {}
         for name, input_node, output_node, branch_node in (
                 ('attention', 'A_layer_input', 'E_pre_mlp_input', 'D_linear_proj_output'),
