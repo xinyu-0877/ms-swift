@@ -19,6 +19,20 @@ def load_output(path):
 def compare(args):
     gpu_payload, gpu = load_output(args.gpu)
     npu_payload, npu = load_output(args.npu)
+    gpu_mode = gpu_payload.get('mode') if isinstance(gpu_payload, dict) else None
+    npu_mode = npu_payload.get('mode') if isinstance(npu_payload, dict) else None
+    gpu_target = gpu_payload.get('target_prefix') if isinstance(gpu_payload, dict) else None
+    npu_target = npu_payload.get('target_prefix') if isinstance(npu_payload, dict) else None
+    invariants = {
+        'gpu_is_replay': gpu_mode == 'replay',
+        'npu_is_capture_or_replay': npu_mode in {'capture', 'replay'},
+        'target_match': gpu_target == npu_target,
+        'expected_target_match': args.expected_target is None or gpu_target == args.expected_target,
+        'numel_match': gpu.numel() == npu.numel(),
+    }
+    failed = [name for name, value in invariants.items() if not value]
+    if failed:
+        raise ValueError(f'Core-attention replay invariants failed: {failed}; invariants={invariants}')
     if gpu.numel() != npu.numel():
         raise ValueError(f'Output numel mismatch: GPU {gpu.numel()}, NPU {npu.numel()}.')
 
@@ -31,6 +45,8 @@ def compare(args):
     cosine_denominator = (gpu_norm * npu_norm).clamp_min(1e-30)
     cosine = (torch.dot(gpu_flat, npu_flat) / cosine_denominator).clamp(-1, 1)
     result = {
+        'invariants': invariants,
+        'target_prefix': gpu_target,
         'gpu_shape': list(gpu.shape),
         'npu_shape': list(npu.shape),
         'numel': gpu.numel(),
@@ -45,8 +61,8 @@ def compare(args):
         'different_ratio': (gpu_flat != npu_flat).double().mean().item(),
         'gpu_norm': gpu_norm.item(),
         'npu_norm': npu_norm.item(),
-        'gpu_mode': gpu_payload.get('mode') if isinstance(gpu_payload, dict) else None,
-        'npu_mode': npu_payload.get('mode') if isinstance(npu_payload, dict) else None,
+        'gpu_mode': gpu_mode,
+        'npu_mode': npu_mode,
     }
     with open(args.output, 'w', encoding='utf-8') as file:
         json.dump(result, file, ensure_ascii=False, indent=2)
@@ -58,6 +74,7 @@ def parse_args():
     parser.add_argument('--gpu', required=True)
     parser.add_argument('--npu', required=True)
     parser.add_argument('--output', required=True)
+    parser.add_argument('--expected-target', help='Expected core-attention module path.')
     return parser.parse_args()
 
 
