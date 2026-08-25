@@ -2305,6 +2305,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'micro_batch': micro_idx,
                 'call_counts': {},
             }
+        self._attention_forward_trace.capture_provenance(
+            data, labels, teacher_output, step, micro_idx)
         try:
             student_output = model(**data)
         finally:

@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import argparse
 import json
+import re
 from pathlib import Path
 
 import torch
@@ -66,6 +67,31 @@ def compare_maps(gpu_values, npu_values):
     return result
 
 
+def _probe_identity(payload):
+    probes = payload.get('provenance', {}).get('student_parameter_probes', {}).get('probes', [])
+    return {p['name']: (p['full_shape'], p['full_dtype'], p['full_numel'],
+                        p['sample_indices'], p['sample']['sha256_fp32']) for p in probes}
+
+
+def provenance_invariants(gpu, npu):
+    gp = gpu.get('provenance')
+    np = npu.get('provenance')
+    if gp is None or np is None:
+        return {'provenance_present': False}
+    return {
+        'provenance_present': True,
+        'input_ids_match': gp.get('input_ids') == np.get('input_ids'),
+        'position_ids_match': gp.get('position_ids') == np.get('position_ids'),
+        'labels_match': gp.get('labels') == np.get('labels'),
+        'num_valid_match': gp.get('num_valid') == np.get('num_valid'),
+        'teacher_logits_match': gp.get('teacher_logits') == np.get('teacher_logits'),
+        'teacher_topk_logprobs_match': gp.get('teacher_topk_logprobs') == np.get('teacher_topk_logprobs'),
+        'teacher_topk_indices_match': gp.get('teacher_topk_indices') == np.get('teacher_topk_indices'),
+        'teacher_labels_match': gp.get('teacher_labels') == np.get('teacher_labels'),
+        'student_parameter_probes_match': bool(_probe_identity(gpu)) and _probe_identity(gpu) == _probe_identity(npu),
+    }
+
+
 def only_tensor(node_values, node):
     if len(node_values) != 1:
         raise ValueError(f'Expected one tensor at {node}, found paths={sorted(node_values)}')
@@ -119,6 +145,8 @@ def main():
     parser.add_argument('--gpu', required=True, help='GPU attention_forward_*.pt path.')
     parser.add_argument('--npu', required=True, help='NPU attention_forward_*.pt path.')
     parser.add_argument('--output', help='Optional JSON result path.')
+    parser.add_argument('--material-increase', type=float, default=0.001,
+                        help='Minimum output-input relative_l2 increase; default 0.001 (0.1%%).')
     args = parser.parse_args()
 
     gpu = torch.load(args.gpu, map_location='cpu', weights_only=True)
@@ -133,7 +161,9 @@ def main():
         'step_match': gpu.get('step') == npu.get('step'),
         'micro_batch_match': gpu.get('micro_batch') == npu.get('micro_batch'),
         'all_nodes_present': set(gpu_nodes) == set(npu_nodes),
+        'runtime_match': gpu.get('runtime') == npu.get('runtime'),
     }
+    invariants.update(provenance_invariants(gpu, npu))
     failed = [name for name, value in invariants.items() if not value]
     if failed:
         raise ValueError(f'Attention forward trace invariants failed: {failed}')
@@ -155,6 +185,10 @@ def main():
         'module_types': {
             'gpu': gpu.get('module_types', {}),
             'npu': npu.get('module_types', {}),
+        },
+        'checkpoint_provenance': {
+            'gpu': gpu.get('checkpoint_provenance'),
+            'npu': npu.get('checkpoint_provenance'),
         },
         'nodes': nodes,
     }
@@ -212,6 +246,33 @@ def main():
                 'npu_norm': metrics['npu_norm'],
             }
         result['layer_summary'] = layer_summary
+        layer_increases = []
+        for index in sorted({int(m.group(1)) for node in layer_summary
+                             if (m := re.fullmatch(r'L(\d+)_input', node))}):
+            input_metrics = layer_summary.get(f'L{index:02d}_input')
+            output_metrics = layer_summary.get(f'L{index:02d}_output')
+            if input_metrics is None or output_metrics is None:
+                continue
+            increase = output_metrics['relative_l2'] - input_metrics['relative_l2']
+            layer_increases.append({
+                'layer': index,
+                'input_relative_l2': input_metrics['relative_l2'],
+                'output_relative_l2': output_metrics['relative_l2'],
+                'increase': increase,
+                'input_percent': input_metrics['relative_l2'] * 100.0,
+                'output_percent': output_metrics['relative_l2'] * 100.0,
+                'increase_percentage_points': increase * 100.0,
+                'material': increase >= args.material_increase,
+            })
+        result['layer_increases'] = layer_increases
+        result['layer_increase_ranking'] = sorted(layer_increases, key=lambda x: x['increase'], reverse=True)
+        result['recommended_layer'] = next(
+            (x for x in layer_increases if x['material']),
+            result['layer_increase_ranking'][0] if layer_increases else None)
+        result['recommendation_basis'] = (
+            'first_material_increase'
+            if any(x['material'] for x in layer_increases)
+            else 'largest_increase_below_threshold')
     output_text = json.dumps(result, ensure_ascii=False, indent=2)
     print(output_text)
     if args.output:

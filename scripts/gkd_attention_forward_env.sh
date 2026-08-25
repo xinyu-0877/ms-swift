@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Source before the existing one-step training command:
 # source scripts/gkd_attention_forward_env.sh DIR TAG [SCOPE] [LAYER_TARGET]
+# Full-tensor scope requires one micro-batch and TP=PP=CP=1. DP is supported.
 
 _gkd_attention_dir=${1:-}
 _gkd_attention_tag=${2:-}
-_gkd_attention_scope=${3:-layer}
+_gkd_attention_scope=${3:-layers}
 _gkd_attention_layer=${4:-decoder.layers.27}
 
 if [[ -z "${_gkd_attention_dir}" || -z "${_gkd_attention_tag}" ]]; then
@@ -23,6 +24,8 @@ unset SWIFT_GKD_MLP_MERGE_MODE
 
 export SWIFT_GKD_ALIGNMENT_DEBUG_START_STEP=0
 export SWIFT_GKD_ALIGNMENT_DEBUG_STEPS=1
+export SWIFT_GKD_ALIGNMENT_DEBUG_DIR="${_gkd_attention_dir}/alignment_${_gkd_attention_tag}"
+export SWIFT_GKD_ALIGNMENT_SAMPLE_COUNT=256
 export SWIFT_GKD_OPERATOR_DEBUG=0
 export SWIFT_GKD_BACKWARD_DEBUG=0
 

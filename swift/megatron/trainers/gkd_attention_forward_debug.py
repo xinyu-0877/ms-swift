@@ -119,6 +119,12 @@ class GKDAttentionForwardTrace:
 
     def _initialize_payload(self):
         if self.payload is None:
+            args = self.trainer.args
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            model_parallel_size = (
+                int(getattr(args, 'tensor_model_parallel_size', 1))
+                * int(getattr(args, 'pipeline_model_parallel_size', 1))
+                * int(getattr(args, 'context_parallel_size', 1)))
             self.payload = {
                 'tag': self.tag,
                 'step': self.step,
@@ -128,7 +134,41 @@ class GKDAttentionForwardTrace:
                 'node_targets': dict(self.node_targets),
                 'module_types': {},
                 'nodes': {},
+                'runtime': {
+                    key: getattr(args, key, None)
+                    for key in (
+                        'tensor_model_parallel_size', 'pipeline_model_parallel_size',
+                        'context_parallel_size', 'micro_batch_size', 'global_batch_size',
+                        'padding_free', 'sequence_parallel', 'attention_backend', 'torch_dtype',
+                    )
+                },
+                'checkpoint_provenance': {
+                    key: str(getattr(args, key, None))
+                    for key in ('model', 'load', 'finetune', 'no_load_optim', 'no_load_rng', 'seed', 'data_seed')
+                },
             }
+            self.payload['runtime']['world_size'] = world_size
+            self.payload['runtime']['data_parallel_size'] = world_size // model_parallel_size
+
+    def capture_provenance(self, data, labels, teacher_output, step, micro_batch):
+        if (not self.enabled or not self.trainer._is_debug_rank()
+                or step != self.step or micro_batch != self.micro_batch):
+            return
+        self._initialize_payload()
+        if 'provenance' in self.payload:
+            raise RuntimeError('Attention trace provenance captured more than once.')
+        self.payload['provenance'] = {
+            'input_ids': self.trainer._tensor_identity(data.get('input_ids')),
+            'position_ids': self.trainer._tensor_identity(data.get('position_ids')),
+            'labels': self.trainer._tensor_identity(labels),
+            'num_valid': int((labels != -100).sum().item()) if labels is not None else None,
+            'teacher_logits': self.trainer._tensor_identity(teacher_output.full_logits),
+            'teacher_topk_logprobs': self.trainer._tensor_identity(teacher_output.topk_logprobs),
+            'teacher_topk_indices': self.trainer._tensor_identity(teacher_output.topk_indices),
+            'teacher_labels': self.trainer._tensor_identity(teacher_output.opsd_teacher_labels),
+            'student_parameter_probes': self.trainer._model_parameter_probe_summary(
+                self.trainer.unwrapped_models),
+        }
 
     def _capture(self, node, module, values):
         if node in self._captured_nodes or not self._context_matches():
@@ -277,12 +317,31 @@ class GKDAttentionForwardTrace:
             raise ValueError(
                 'Attention forward trace requires exactly one micro-batch. '
                 'Set global_batch_size equal to micro_batch_size.')
+        parallel_sizes = {
+            name: int(getattr(self.trainer.args, name, 1))
+            for name in (
+                'tensor_model_parallel_size',
+                'pipeline_model_parallel_size',
+                'context_parallel_size',
+            )
+        }
+        invalid = {name: size for name, size in parallel_sizes.items() if size != 1}
+        if invalid:
+            raise ValueError(
+                'Attention full-tensor trace requires TP=1, PP=1, and CP=1; '
+                f'got {invalid}. Sharded captures are not full model tensors.')
+        if not self.trainer._is_debug_rank():
+            return
         if not debug_active:
             raise ValueError('Attention forward trace step must be inside the alignment debug window.')
 
     def finalize_train_step(self, step):
         if not self.enabled or step != self.step:
             return
+        if not self.trainer._is_debug_rank():
+            return
+        if self.payload is None or 'provenance' not in self.payload:
+            raise RuntimeError('Attention trace did not capture input/parameter provenance.')
         expected = set(self.node_targets)
         missing = sorted(expected - self._captured_nodes)
         if missing:
