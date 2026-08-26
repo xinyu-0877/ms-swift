@@ -2498,6 +2498,13 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     if output_tensor.requires_grad:
                         output_tensor.register_hook(logits_gradient_hook)
                 result = loss_callback(output_tensor)
+                self._microbatch_backward_trace.capture_loss(
+                    step,
+                    micro_idx,
+                    result[0],
+                    result[1],
+                    self._alignment_loss_context,
+                )
                 write_loss_record()
                 return result
 

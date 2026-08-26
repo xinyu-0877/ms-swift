@@ -11,7 +11,7 @@ logger = get_logger()
 
 
 class GKDMicrobatchBackwardTrace:
-    """Capture native dLogits and decoder backward boundaries per micro-batch."""
+    """Capture native logits, loss, dLogits, and backward boundaries per micro-batch."""
 
     def __init__(self, trainer):
         self.trainer = trainer
@@ -62,11 +62,13 @@ class GKDMicrobatchBackwardTrace:
 
     def _record(self, step, micro_batch):
         return self.records.setdefault((int(step), int(micro_batch)), {
-            'format': 'swift_gkd_microbatch_backward_v1',
+            'format': 'swift_gkd_microbatch_backward_v2',
             'tag': self.tag,
             'step': int(step),
             'micro_batch': int(micro_batch),
             'provenance': None,
+            'student_logits': None,
+            'loss': None,
             'dlogits': None,
             'boundaries': {},
         })
@@ -90,6 +92,7 @@ class GKDMicrobatchBackwardTrace:
             'teacher_labels': self.trainer._tensor_identity(
                 teacher_output.opsd_teacher_labels),
         }
+        record['student_logits'] = student_output.detach().cpu().contiguous()
         if not student_output.requires_grad:
             raise ValueError('Micro-batch backward trace requires differentiable student logits.')
 
@@ -101,6 +104,22 @@ class GKDMicrobatchBackwardTrace:
             return gradient
 
         student_output.register_hook(dlogits_hook)
+
+    def capture_loss(self, step, micro_batch, loss, metric, details):
+        if not self.active(step):
+            return
+        record = self._record(step, micro_batch)
+        if record['loss'] is not None:
+            raise RuntimeError(
+                f'Loss was captured more than once for step={step}, micro_batch={micro_batch}.')
+        record['loss'] = {
+            'backward_loss': float(loss.detach().float().cpu()),
+            'metrics': {
+                name: float(value.detach().float().cpu())
+                for name, value in metric.items()
+            },
+            'details': dict(details or {}),
+        }
 
     @staticmethod
     def _is_boundary(name):
@@ -173,10 +192,15 @@ class GKDMicrobatchBackwardTrace:
                 f'actual={sorted(actual_indices)}.')
         for micro_batch in sorted(actual_indices):
             record = self.records[(self.step, micro_batch)]
-            if record['provenance'] is None or record['dlogits'] is None:
+            if (record['provenance'] is None
+                    or record['student_logits'] is None
+                    or record['loss'] is None
+                    or record['dlogits'] is None):
                 raise RuntimeError(
                     f'Micro-batch trace is incomplete at micro_batch={micro_batch}: '
                     f'provenance={record["provenance"] is not None}, '
+                    f'student_logits={record["student_logits"] is not None}, '
+                    f'loss={record["loss"] is not None}, '
                     f'dlogits={record["dlogits"] is not None}.')
             actual_boundaries = set(record['boundaries'])
             if actual_boundaries != self.expected_boundaries:

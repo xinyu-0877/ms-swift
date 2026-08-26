@@ -27,7 +27,7 @@ def discover(directory, step):
     pattern = f'microbatch_backward_*_step_{step:06d}_micro_*.pt'
     for path in Path(directory).glob(pattern):
         payload = torch.load(path, map_location='cpu', weights_only=True)
-        if payload.get('format') != 'swift_gkd_microbatch_backward_v1':
+        if payload.get('format') != 'swift_gkd_microbatch_backward_v2':
             continue
         if int(payload.get('step', -1)) != step:
             continue
@@ -97,6 +97,45 @@ def compare_optional(gpu_tensor, npu_tensor):
     return compare_tensor(gpu_tensor, npu_tensor)
 
 
+def compare_scalar(gpu_value, npu_value):
+    gpu_value = float(gpu_value)
+    npu_value = float(npu_value)
+    absolute_difference = abs(gpu_value - npu_value)
+    return {
+        'gpu': gpu_value,
+        'npu': npu_value,
+        'absolute_difference': absolute_difference,
+        'relative_difference': absolute_difference / max(
+            abs(gpu_value), abs(npu_value), EPSILON),
+        'finite': math.isfinite(gpu_value) and math.isfinite(npu_value),
+    }
+
+
+def compare_loss(gpu_loss, npu_loss):
+    gpu_metrics = gpu_loss.get('metrics', {})
+    npu_metrics = npu_loss.get('metrics', {})
+    gpu_details = gpu_loss.get('details', {})
+    npu_details = npu_loss.get('details', {})
+    if set(gpu_metrics) != set(npu_metrics):
+        raise ValueError(
+            f'Loss metric sets differ: GPU={sorted(gpu_metrics)}, NPU={sorted(npu_metrics)}')
+    if set(gpu_details) != set(npu_details):
+        raise ValueError(
+            f'Loss detail sets differ: GPU={sorted(gpu_details)}, NPU={sorted(npu_details)}')
+    return {
+        'backward_loss': compare_scalar(
+            gpu_loss['backward_loss'], npu_loss['backward_loss']),
+        'metrics': {
+            name: compare_scalar(gpu_metrics[name], npu_metrics[name])
+            for name in sorted(gpu_metrics)
+        },
+        'details': {
+            name: compare_scalar(gpu_details[name], npu_details[name])
+            for name in sorted(gpu_details)
+        },
+    }
+
+
 def layer_index(name):
     match = re.fullmatch(r'model\d+\.decoder\.layers\.(\d+)', name)
     return int(match.group(1)) if match else None
@@ -154,6 +193,8 @@ def compare_micro_batch(gpu, npu):
                 gpu_boundary.get('output_gradient'), npu_boundary.get('output_gradient')),
         }
 
+    student_logits = compare_tensor(gpu['student_logits'], npu['student_logits'])
+    loss = compare_loss(gpu['loss'], npu['loss'])
     dlogits = compare_tensor(gpu['dlogits'], npu['dlogits'])
     layer_rows = []
     for name, values in boundaries.items():
@@ -182,6 +223,8 @@ def compare_micro_batch(gpu, npu):
     return {
         'invariants': invariants,
         'micro_batch': int(gpu['micro_batch']),
+        'student_logits': student_logits,
+        'loss': loss,
         'dlogits': dlogits,
         'boundaries': boundaries,
         'layers_backward_order': layer_rows,
@@ -218,6 +261,9 @@ def main():
         'step': args.step,
         'micro_batches': [{
             'micro_batch': item['micro_batch'],
+            'student_logits_relative_l2': item['student_logits']['relative_l2'],
+            'student_logits_cosine': item['student_logits']['cosine'],
+            'loss': item['loss']['backward_loss'],
             'dlogits_relative_l2': item['dlogits']['relative_l2'],
             'dlogits_cosine': item['dlogits']['cosine'],
             'largest_adjacent_increases': item['largest_adjacent_increases'][:5],
