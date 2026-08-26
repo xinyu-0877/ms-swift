@@ -28,6 +28,7 @@ from swift.template import Template
 from swift.utils import get_cu_seqlens_from_position_ids, get_logger, is_last_rank, to_device
 from ..utils import forward_step_helper, get_padding_to
 from .gkd_attention_forward_debug import GKDAttentionForwardTrace
+from .gkd_microbatch_backward_debug import GKDMicrobatchBackwardTrace
 from .gkd_utils import cp_reduce, tp_gather_topk, vocab_parallel_topk
 from .gkd_mlp_merge_debug import GKDMLPMergeIsolation
 from .rlhf_mixin import MegatronRLHFTrainer
@@ -292,6 +293,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             raise ValueError('FC1 isolation step and micro-batch must be non-negative.')
         self._mlp_merge_isolation = GKDMLPMergeIsolation(self)
         self._attention_forward_trace = GKDAttentionForwardTrace(self)
+        self._microbatch_backward_trace = GKDMicrobatchBackwardTrace(self)
         self._teacher_cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
         self._teacher_cache_dir = os.getenv('SWIFT_GKD_TEACHER_CACHE_DIR')
         reuse_step = os.getenv('SWIFT_GKD_TEACHER_CACHE_REUSE_STEP')
@@ -387,6 +389,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             self._mlp_merge_isolation.register_hooks()
         if self._attention_forward_trace.enabled:
             self._attention_forward_trace.register_hooks()
+        if self._microbatch_backward_trace.enabled:
+            self._microbatch_backward_trace.register_hooks()
 
     @property
     def _alignment_debug_path(self):
@@ -1791,6 +1795,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
     def train_step(self, train_data_iterator):
         step = int(self.state.iteration)
         debug_active = self._alignment_debug_active(step)
+        self._microbatch_backward_trace.prepare_train_step(step, debug_active)
         if self._dlogits_isolation_mode and step == self._dlogits_isolation_step:
             if self.args.num_microbatches != 1:
                 raise ValueError(
@@ -1816,6 +1821,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             if debug_active and self._backward_debug_enabled else None
         )
         result = super().train_step(train_data_iterator)
+        self._microbatch_backward_trace.finalize_train_step(
+            step, self.args.num_microbatches)
         if self._grad_clip_debug_active(step):
             _, grad_norm, update_successful = result
             self._write_grad_clip_record(step, grad_norm, update_successful)
@@ -2434,6 +2441,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         self._capture_jsd_isolation_inputs(
             student_output, teacher_output, labels, step, micro_idx)
+        self._microbatch_backward_trace.capture_forward(
+            data, labels, teacher_output, student_output, step, micro_idx)
 
         if debug_active:
             teacher_logits = teacher_output.full_logits
@@ -2470,7 +2479,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                         or self._dlogits_isolation_mode
                         or self._swiglu_isolation_mode
                         or self._fc1_isolation_mode
-                        or self._mlp_merge_isolation.enabled):
+                        or self._mlp_merge_isolation.enabled
+                        or self._microbatch_backward_trace.enabled):
                     self._backward_debug_context = {
                         'step': step,
                         'micro_batch': micro_idx,
