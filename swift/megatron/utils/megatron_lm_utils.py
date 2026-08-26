@@ -518,12 +518,19 @@ def wrap_model(args, models, wrap_with_ddp: bool = True):
     # DDP
     if not wrap_with_ddp:
         return
+    ddp_fields = {f.name for f in dataclasses.fields(DistributedDataParallelConfig)}
     kwargs = {}
     for f in dataclasses.fields(DistributedDataParallelConfig):
         if hasattr(args, f.name):
             kwargs[f.name] = getattr(args, f.name)
+    if 'grad_reduce_in_fp32' in ddp_fields and hasattr(args, 'accumulate_allreduce_grads_in_fp32'):
+        kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
     kwargs['check_for_nan_in_grad'] = True
     ddp_config = DistributedDataParallelConfig(**kwargs)
+    logger.info(
+        'DDP gradient precision: '
+        f'accumulate_allreduce_grads_in_fp32={getattr(args, "accumulate_allreduce_grads_in_fp32", None)}, '
+        f'grad_reduce_in_fp32={getattr(ddp_config, "grad_reduce_in_fp32", None)}')
 
     # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
     # If bucket_size is not provided as an input, use sane default.
