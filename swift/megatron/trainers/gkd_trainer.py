@@ -4,6 +4,7 @@ import inspect
 import json
 import os
 import random
+import re
 import torch
 import torch.nn.functional as F
 from contextlib import contextmanager
@@ -102,6 +103,32 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'SWIFT_GKD_GRAD_CLIP_DEBUG_START_STEP.')
         if self._grad_clip_debug_steps > 0 and not self._grad_clip_debug_dir:
             self._grad_clip_debug_dir = os.path.join(args.output_dir, 'gkd_grad_clip_debug')
+        self._preclip_grad_dir = os.getenv('SWIFT_GKD_PRECLIP_GRAD_DIR')
+        self._preclip_grad_tag = os.getenv('SWIFT_GKD_PRECLIP_GRAD_TAG', '').strip()
+        preclip_steps = os.getenv('SWIFT_GKD_PRECLIP_GRAD_STEPS', '').strip()
+        try:
+            parsed_preclip_steps = [int(value.strip()) for value in preclip_steps.split(',') if value.strip()]
+        except ValueError as error:
+            raise ValueError('SWIFT_GKD_PRECLIP_GRAD_STEPS must contain comma-separated integers.') from error
+        if any(step < 0 for step in parsed_preclip_steps):
+            raise ValueError('SWIFT_GKD_PRECLIP_GRAD_STEPS must contain only non-negative integers.')
+        if len(parsed_preclip_steps) != len(set(parsed_preclip_steps)):
+            raise ValueError('SWIFT_GKD_PRECLIP_GRAD_STEPS must not contain duplicate steps.')
+        self._preclip_grad_steps = set(parsed_preclip_steps)
+        self._preclip_grad_chunk_numel = int(
+            os.getenv('SWIFT_GKD_PRECLIP_GRAD_CHUNK_NUMEL', str(4 * 1024 * 1024)))
+        if self._preclip_grad_chunk_numel <= 0:
+            raise ValueError('SWIFT_GKD_PRECLIP_GRAD_CHUNK_NUMEL must be greater than 0.')
+        if self._preclip_grad_steps:
+            if not self._preclip_grad_dir:
+                raise ValueError('SWIFT_GKD_PRECLIP_GRAD_DIR is required when gradient capture is enabled.')
+            if not self._preclip_grad_tag:
+                raise ValueError('SWIFT_GKD_PRECLIP_GRAD_TAG is required when gradient capture is enabled.')
+            if not re.fullmatch(r'[A-Za-z0-9_-]+', self._preclip_grad_tag):
+                raise ValueError('SWIFT_GKD_PRECLIP_GRAD_TAG may contain only letters, digits, _ and -.')
+            logger.info(
+                f'GKD full pre-clip gradient capture enabled: tag={self._preclip_grad_tag}, '
+                f'steps={sorted(self._preclip_grad_steps)}, dir={self._preclip_grad_dir}')
         self._operator_debug_enabled = os.getenv(
             'SWIFT_GKD_OPERATOR_DEBUG', '0').lower() in {'1', 'true', 'yes'}
         self._operator_debug_layer_io = os.getenv(
@@ -374,6 +401,90 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
     @staticmethod
     def _is_debug_rank():
         return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+    @staticmethod
+    def _is_preclip_grad_capture_rank():
+        # Gradients are replicated across the data-parallel group. Keep DP rank 0,
+        # while retaining every tensor/pipeline partition when model parallelism is used.
+        return not torch.distributed.is_initialized() or mpu.get_data_parallel_rank() == 0
+
+    def _capture_preclip_gradients(self, step):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        step_dir = os.path.join(
+            self._preclip_grad_dir, f'step_{step:06d}_rank_{rank:05d}')
+        if os.path.exists(os.path.join(step_dir, 'manifest.json')):
+            raise FileExistsError(f'Pre-clip gradient capture already exists: {step_dir}')
+        os.makedirs(step_dir, exist_ok=True)
+
+        parameters = []
+        seen_parameters = set()
+        parameter_index = 0
+        for model_index, model in enumerate(self.unwrapped_models):
+            for name, parameter in model.named_parameters():
+                if not parameter.requires_grad or id(parameter) in seen_parameters:
+                    continue
+                seen_parameters.add(id(parameter))
+                gradient = getattr(parameter, 'main_grad', None)
+                source = 'main_grad'
+                if gradient is None:
+                    gradient = parameter.grad
+                    source = 'grad'
+                entry = {
+                    'name': f'model{model_index}.{name}',
+                    'model_index': model_index,
+                    'shape': list(parameter.shape),
+                    'parameter_dtype': str(parameter.dtype),
+                    'gradient_present': gradient is not None,
+                    'gradient_source': source if gradient is not None else None,
+                    'gradient_dtype': str(gradient.dtype) if gradient is not None else None,
+                    'gradient_shape': list(gradient.shape) if gradient is not None else None,
+                    'numel': parameter.numel(),
+                    'parts': [],
+                }
+                if gradient is not None:
+                    if gradient.numel() != parameter.numel():
+                        raise ValueError(
+                            f'Gradient buffer size differs from parameter {entry["name"]}: '
+                            f'gradient={gradient.numel()}, parameter={parameter.numel()}')
+                    flat_gradient = gradient.detach().reshape(-1)
+                    for part_index, start in enumerate(
+                            range(0, flat_gradient.numel(), self._preclip_grad_chunk_numel)):
+                        end = min(start + self._preclip_grad_chunk_numel, flat_gradient.numel())
+                        filename = f'param_{parameter_index:06d}_part_{part_index:05d}.pt'
+                        value = flat_gradient[start:end].cpu().contiguous()
+                        torch.save(value, os.path.join(step_dir, filename))
+                        entry['parts'].append({'file': filename, 'start': start, 'end': end})
+                parameters.append(entry)
+                parameter_index += 1
+
+        manifest = {
+            'format': 'swift_gkd_preclip_grad_v1',
+            'tag': self._preclip_grad_tag,
+            'step': step,
+            'rank': rank,
+            'world_size': torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
+            'tensor_model_parallel_size': getattr(self.args, 'tensor_model_parallel_size', 1),
+            'pipeline_model_parallel_size': getattr(self.args, 'pipeline_model_parallel_size', 1),
+            'context_parallel_size': getattr(self.args, 'context_parallel_size', 1),
+            'data_parallel_size': (
+                mpu.get_data_parallel_world_size() if torch.distributed.is_initialized() else 1),
+            'main_grads_dtype': str(getattr(self.args, 'main_grads_dtype', None)),
+            'clip_grad': float(getattr(self.args, 'clip_grad', 0.0)),
+            'chunk_numel': self._preclip_grad_chunk_numel,
+            'parameter_count': len(parameters),
+            'parameters': parameters,
+        }
+        manifest_path = os.path.join(step_dir, 'manifest.json')
+        with open(manifest_path, 'w', encoding='utf-8') as file:
+            json.dump(manifest, file, indent=2)
+        logger.info(
+            f'GKD pre-clip gradients saved: step={step}, rank={rank}, '
+            f'parameters={len(parameters)}, path={step_dir}')
+
+    def _before_optimizer_step(self):
+        step = int(self.state.iteration)
+        if step in self._preclip_grad_steps and self._is_preclip_grad_capture_rank():
+            self._capture_preclip_gradients(step)
 
     def _alignment_debug_active(self, step=None):
         step = int(self.state.iteration) if step is None else int(step)

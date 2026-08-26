@@ -889,6 +889,10 @@ class BaseMegatronTrainer(ABC):
     def _replace_data_iterator(self, data_iterator):
         return data_iterator
 
+    def _before_optimizer_step(self):
+        """Hook for diagnostics that need the final accumulated, pre-clip gradients."""
+        pass
+
     def train_step(self, train_data_iterator):
         args = self.args
         forward_backward_func = get_forward_backward_func()
@@ -911,6 +915,7 @@ class BaseMegatronTrainer(ABC):
             forward_only=False,
         )
 
+        self._before_optimizer_step()
         update_successful, grad_norm, _ = self.optimizer.step()
         update_successful = logical_and_across_model_parallel_group(update_successful)
         grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
