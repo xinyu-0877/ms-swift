@@ -31,6 +31,7 @@ from .gkd_attention_forward_debug import GKDAttentionForwardTrace
 from .gkd_microbatch_backward_debug import GKDMicrobatchBackwardTrace
 from .gkd_utils import cp_reduce, tp_gather_topk, vocab_parallel_topk
 from .gkd_mlp_merge_debug import GKDMLPMergeIsolation
+from .gkd_self_attention_forward_debug import GKDSelfAttentionForwardIsolation
 from .rlhf_mixin import MegatronRLHFTrainer
 from .rollout_mixin import MegatronRolloutMixin
 from .utils import load_megatron_model_to_gpu, offload_megatron_model_to_cpu
@@ -292,6 +293,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         if self._fc1_isolation_step < 0 or self._fc1_isolation_micro_batch < 0:
             raise ValueError('FC1 isolation step and micro-batch must be non-negative.')
         self._mlp_merge_isolation = GKDMLPMergeIsolation(self)
+        self._self_attention_forward_isolation = GKDSelfAttentionForwardIsolation(self)
         self._attention_forward_trace = GKDAttentionForwardTrace(self)
         self._microbatch_backward_trace = GKDMicrobatchBackwardTrace(self)
         self._teacher_cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
@@ -387,6 +389,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             self._register_fc1_isolation_hooks()
         if self._mlp_merge_isolation.enabled:
             self._mlp_merge_isolation.register_hooks()
+        if self._self_attention_forward_isolation.enabled:
+            self._self_attention_forward_isolation.register_hooks()
         if self._attention_forward_trace.enabled:
             self._attention_forward_trace.register_hooks()
         if self._microbatch_backward_trace.enabled:
@@ -1820,6 +1824,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 raise ValueError('FC1 isolation target step must be inside the alignment debug window.')
         self._mlp_merge_isolation.prepare_train_step(
             step, debug_active, self.args.num_microbatches)
+        self._self_attention_forward_isolation.prepare_train_step(
+            step, debug_active, self.args.num_microbatches)
         self._attention_forward_trace.prepare_train_step(
             step, debug_active, self.args.num_microbatches)
         before = self._capture_trainable_tensors() if debug_active else None
@@ -1862,6 +1868,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             torch.save(self._fc1_isolation_result, self._fc1_isolation_result_path)
             logger.info(f'Saved FC1 isolation result: {self._fc1_isolation_result_path}')
         self._mlp_merge_isolation.finalize_train_step(step)
+        self._self_attention_forward_isolation.finalize_train_step(step)
         self._attention_forward_trace.finalize_train_step(step)
         if self._dlogits_isolation_mode and step == self._dlogits_isolation_step:
             if not self._dlogits_hook_done:
@@ -2424,6 +2431,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 or self._swiglu_isolation_mode
                 or self._fc1_isolation_mode
                 or self._mlp_merge_isolation.enabled
+                or self._self_attention_forward_isolation.enabled
                 or self._attention_forward_trace.enabled):
             self._operator_debug_context = {
                 'step': step,
