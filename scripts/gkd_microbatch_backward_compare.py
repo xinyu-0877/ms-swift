@@ -23,10 +23,19 @@ def parse_args():
 
 
 def discover(directory, step):
+    directory = Path(directory)
+    if not directory.is_dir():
+        raise ValueError(f'Micro-batch backward directory does not exist: {directory}')
     payloads = {}
     pattern = f'microbatch_backward_*_step_{step:06d}_micro_*.pt'
-    for path in Path(directory).glob(pattern):
+    observed = []
+    for path in directory.glob(pattern):
         payload = torch.load(path, map_location='cpu', weights_only=True)
+        observed.append({
+            'path': str(path),
+            'format': payload.get('format'),
+            'step': payload.get('step'),
+        })
         if payload.get('format') != 'swift_gkd_microbatch_backward_v2':
             continue
         if int(payload.get('step', -1)) != step:
@@ -37,7 +46,14 @@ def discover(directory, step):
                 f'Duplicate micro-batch {micro_batch} captures under {directory}.')
         payloads[micro_batch] = (path, payload)
     if not payloads:
-        raise ValueError(f'No step {step} micro-batch backward captures under {directory}.')
+        nested = [
+            str(path) for path in directory.rglob(pattern)
+            if path.parent != directory
+        ]
+        raise ValueError(
+            f'No compatible v2 step {step} micro-batch backward captures directly under '
+            f'{directory}. Direct candidates={observed}; nested candidates={nested}. '
+            'A v1 capture does not contain full student_logits/loss and must be regenerated.')
     return payloads
 
 
