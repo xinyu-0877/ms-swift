@@ -22,6 +22,11 @@ LAYER_NODE_ORDER = (
     'G_layer_output',
 )
 
+DECODER_TAIL_NODE_ORDER = (
+    'Z00_final_layernorm_output',
+    'Z01_output_layer_logits',
+)
+
 
 def tensor_metrics(gpu_tensor, npu_tensor):
     gpu = gpu_tensor.detach().double().cpu().contiguous().reshape(-1)
@@ -185,6 +190,15 @@ def print_summary(result, output_path, material_increase, top_k):
             f'{row["increase_percentage_points"]:+12.6f} '
             f'{output_metrics["cosine"]:.9f}')
 
+    print('\nDecoder tail boundaries:')
+    print('boundary                    rel_l2       delta_pp          cos')
+    for row in result.get('decoder_tail_increases', []):
+        print(
+            f'{row["label"]:<27} '
+            f'{format_percent(row["relative_l2"]):>11} '
+            f'{row["increase_percentage_points"]:+14.6f} '
+            f'{row["cosine"]:.9f}')
+
     print(f'\nTop {min(top_k, len(result["layer_increase_ranking"]))} output-input increases:')
     for rank, row in enumerate(result['layer_increase_ranking'][:top_k], start=1):
         print(
@@ -251,6 +265,12 @@ def main():
             f'actual={sorted(gpu_nodes)}')
     if scope == 'layers' and not gpu_nodes:
         raise ValueError('Layer scan contains no nodes.')
+    if scope == 'layers':
+        missing_tail = set(DECODER_TAIL_NODE_ORDER) - set(gpu_nodes)
+        if missing_tail:
+            raise ValueError(
+                f'Layer scan is missing decoder-tail nodes: {sorted(missing_tail)}. '
+                'Regenerate both captures with the updated trace implementation.')
 
     node_order = LAYER_NODE_ORDER if scope == 'layer' else sorted(gpu_nodes)
     nodes = {node: compare_maps(gpu_nodes[node], npu_nodes[node]) for node in node_order}
@@ -350,6 +370,37 @@ def main():
             'first_material_increase'
             if any(x['material'] for x in layer_increases)
             else 'largest_increase_below_threshold')
+        last_layer_output = max(
+            (node for node in layer_summary if re.fullmatch(r'L\d+_output', node)),
+            key=lambda node: int(re.fullmatch(r'L(\d+)_output', node).group(1)),
+        )
+        tail_chain = (
+            ('last_layer_output', last_layer_output),
+            ('final_layernorm_output', 'Z00_final_layernorm_output'),
+            ('output_layer_logits', 'Z01_output_layer_logits'),
+        )
+        decoder_tail_increases = []
+        previous_metrics = None
+        for label, node in tail_chain:
+            metrics = layer_summary.get(node)
+            if metrics is None:
+                raise ValueError(f'Decoder-tail primary tensor is missing: {node}.')
+            increase = (
+                0.0 if previous_metrics is None
+                else metrics['relative_l2'] - previous_metrics['relative_l2'])
+            decoder_tail_increases.append({
+                'label': label,
+                'node': node,
+                'relative_l2': metrics['relative_l2'],
+                'relative_percent': metrics['relative_l2'] * 100.0,
+                'increase': increase,
+                'increase_percentage_points': increase * 100.0,
+                'cosine': metrics['cosine'],
+                'gpu_norm': metrics['gpu_norm'],
+                'npu_norm': metrics['npu_norm'],
+            })
+            previous_metrics = metrics
+        result['decoder_tail_increases'] = decoder_tail_increases
     output_text = json.dumps(result, ensure_ascii=False, indent=2)
     output_path = None
     if args.output:

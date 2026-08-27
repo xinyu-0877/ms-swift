@@ -11,6 +11,12 @@ from swift.utils import get_logger
 logger = get_logger()
 
 
+DECODER_TAIL_TARGETS = {
+    'Z00_final_layernorm_output': 'decoder.final_layernorm',
+    'Z01_output_layer_logits': 'output_layer',
+}
+
+
 class GKDAttentionForwardTrace:
     """Capture decoder-layer outputs or Layer-N boundaries, including core-attention Q/K/V."""
 
@@ -286,29 +292,47 @@ class GKDAttentionForwardTrace:
 
     def _register_layer_scan_hooks(self):
         matched = []
+        matched_tail = {node: [] for node in DECODER_TAIL_TARGETS}
+        tail_target_to_node = {
+            target: node for node, target in DECODER_TAIL_TARGETS.items()
+        }
         for model in self.trainer.unwrapped_models:
             for name, module in model.named_modules():
                 match = re.fullmatch(r'decoder\.layers\.(\d+)', name)
-                if match is None:
+                if match is not None:
+                    layer_index = int(match.group(1))
+                    input_node = f'L{layer_index:02d}_input'
+                    output_node = f'L{layer_index:02d}_output'
+                    self.node_targets[input_node] = name
+                    self.node_targets[output_node] = name
+                    self.handles.extend([
+                        module.register_forward_pre_hook(
+                            self._pre_hook(input_node), with_kwargs=True),
+                        module.register_forward_hook(
+                            self._forward_hook(output_node), with_kwargs=True),
+                    ])
+                    matched.append(f'{name} ({type(module).__name__})')
                     continue
-                layer_index = int(match.group(1))
-                input_node = f'L{layer_index:02d}_input'
-                output_node = f'L{layer_index:02d}_output'
-                self.node_targets[input_node] = name
-                self.node_targets[output_node] = name
-                self.handles.extend([
-                    module.register_forward_pre_hook(
-                        self._pre_hook(input_node), with_kwargs=True),
-                    module.register_forward_hook(
-                        self._forward_hook(output_node), with_kwargs=True),
-                ])
-                matched.append(f'{name} ({type(module).__name__})')
+                tail_node = tail_target_to_node.get(name)
+                if tail_node is not None:
+                    self.node_targets[tail_node] = name
+                    self.handles.append(module.register_forward_hook(
+                        self._forward_hook(tail_node), with_kwargs=True))
+                    matched_tail[tail_node].append(
+                        f'{name} ({type(module).__name__})')
         if not matched:
             raise ValueError('Attention forward layer scan found no decoder.layers.N modules.')
+        invalid_tail = {
+            node: modules for node, modules in matched_tail.items() if len(modules) != 1
+        }
+        if invalid_tail:
+            raise ValueError(
+                'Attention forward decoder-tail targets must each match exactly once: '
+                f'{invalid_tail}.')
         os.makedirs(self.output_dir, exist_ok=True)
         logger.info(
             f'GKD full layer forward scan enabled: layers={len(matched)}, '
-            f'output={self.output_path}, matched={matched}')
+            f'output={self.output_path}, matched={matched}, tail={matched_tail}')
 
     def prepare_train_step(self, step, debug_active, num_microbatches):
         if not self.enabled or step != self.step:
