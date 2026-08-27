@@ -139,6 +139,77 @@ def residual_closure(payload, input_node, output_node, branch_node):
     }
 
 
+def format_percent(value):
+    return f'{value * 100.0:.6f}%'
+
+
+def print_metric(node, path, metrics):
+    print(
+        f'{node:<32} path={path:<16} '
+        f'rel_l2={format_percent(metrics["relative_l2"]):>11} '
+        f'cos={metrics["cosine"]:.9f} '
+        f'max_abs={metrics["max_abs"]:.8g}')
+
+
+def print_summary(result, output_path, material_increase, top_k):
+    saved_path = output_path if output_path is not None else 'not saved (--output omitted)'
+    print(f'Full report: {saved_path}')
+    print(f'Scope: {result["scope"]}')
+    print(f'Invariants: all passed ({len(result["invariants"])})')
+
+    if result['scope'] == 'layer':
+        print('\nA-G boundaries:')
+        for node in LAYER_NODE_ORDER:
+            for path, metrics in result['nodes'][node].items():
+                if 'relative_l2' in metrics:
+                    print_metric(node, path, metrics)
+        print('\nResidual closures:')
+        for name, closure in result['residual_closures'].items():
+            native = closure['inferred_branch_gpu_vs_npu']
+            gpu = closure['gpu_branch_candidate_vs_inferred']
+            npu = closure['npu_branch_candidate_vs_inferred']
+            print(
+                f'{name:<10} branch_rel_l2={format_percent(native["relative_l2"]):>11} '
+                f'gpu_closure={format_percent(gpu["relative_l2"]):>11} '
+                f'npu_closure={format_percent(npu["relative_l2"]):>11}')
+        return
+
+    print('\nLayer boundaries:')
+    print('layer       input_rel_l2 output_rel_l2     delta_pp  output_cos')
+    for row in result['layer_increases']:
+        output_metrics = result['layer_summary'][f'L{row["layer"]:02d}_output']
+        print(
+            f'L{row["layer"]:02d} '
+            f'{format_percent(row["input_relative_l2"]):>18} '
+            f'{format_percent(row["output_relative_l2"]):>14} '
+            f'{row["increase_percentage_points"]:+12.6f} '
+            f'{output_metrics["cosine"]:.9f}')
+
+    print(f'\nTop {min(top_k, len(result["layer_increase_ranking"]))} output-input increases:')
+    for rank, row in enumerate(result['layer_increase_ranking'][:top_k], start=1):
+        print(
+            f'{rank:>2}. L{row["layer"]:02d}: '
+            f'{format_percent(row["input_relative_l2"])} -> '
+            f'{format_percent(row["output_relative_l2"])} '
+            f'({row["increase_percentage_points"]:+.6f} pp)')
+
+    first_material = next(
+        (row for row in result['layer_increases'] if row['increase'] >= material_increase),
+        None)
+    if first_material is None:
+        print(f'First material increase: none (threshold={format_percent(material_increase)})')
+    else:
+        print(
+            f'First material increase: L{first_material["layer"]:02d} '
+            f'({format_percent(first_material["input_relative_l2"])} -> '
+            f'{format_percent(first_material["output_relative_l2"])})')
+    recommended = result['recommended_layer']
+    if recommended is not None:
+        print(
+            f'Recommended A-G target: decoder.layers.{recommended["layer"]} '
+            f'(basis={result["recommendation_basis"]})')
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Compare GPU/NPU Layer-N attention forward boundary captures.')
@@ -147,7 +218,13 @@ def main():
     parser.add_argument('--output', help='Optional JSON result path.')
     parser.add_argument('--material-increase', type=float, default=0.001,
                         help='Minimum output-input relative_l2 increase; default 0.001 (0.1%%).')
+    parser.add_argument('--top-k', type=int, default=5,
+                        help='Number of largest layer increases printed; default 5.')
     args = parser.parse_args()
+    if args.material_increase < 0:
+        raise ValueError('--material-increase must be non-negative.')
+    if args.top_k <= 0:
+        raise ValueError('--top-k must be positive.')
 
     gpu = torch.load(args.gpu, map_location='cpu', weights_only=True)
     npu = torch.load(args.npu, map_location='cpu', weights_only=True)
@@ -274,11 +351,12 @@ def main():
             if any(x['material'] for x in layer_increases)
             else 'largest_increase_below_threshold')
     output_text = json.dumps(result, ensure_ascii=False, indent=2)
-    print(output_text)
+    output_path = None
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(output_text + '\n', encoding='utf-8')
+    print_summary(result, output_path, args.material_increase, args.top_k)
 
 
 if __name__ == '__main__':
