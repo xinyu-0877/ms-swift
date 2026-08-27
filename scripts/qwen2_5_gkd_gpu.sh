@@ -19,7 +19,7 @@ export HF_DATASETS_CACHE="${HF_HOME}/datasets"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 
 STUDENT_MODEL="${STUDENT_MODEL:-Qwen/Qwen2.5-0.5B}"
 TEACHER_MODEL="${TEACHER_MODEL:-Qwen/Qwen2.5-7B}"
@@ -31,6 +31,7 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 GRAD_ACC="${GRAD_ACC:-4}"
 SEED="${SEED:-42}"
+USE_HF="${USE_HF:-true}"
 
 # Prevent stale precision-isolation settings from changing a normal training run.
 unset SWIFT_GKD_ALIGNMENT_DEBUG_START_STEP
@@ -67,12 +68,14 @@ fi
 
 python - <<'PY'
 import torch
+from importlib.metadata import version
 
 print('PyTorch version:', torch.__version__)
 print('CUDA available:', torch.cuda.is_available())
 if not torch.cuda.is_available():
     raise RuntimeError('No NVIDIA GPU is available.')
 print('CUDA device:', torch.cuda.get_device_name(0))
+print('mcore-bridge version:', version('mcore-bridge'))
 PY
 
 nvidia-smi
@@ -89,6 +92,7 @@ nvidia-smi
   echo "eval_batch_size=${EVAL_BATCH_SIZE}"
   echo "gradient_accumulation_steps=${GRAD_ACC}"
   echo "seed=${SEED}"
+  echo "use_hf=${USE_HF}"
   echo "visible_devices=${CUDA_VISIBLE_DEVICES}"
   echo "nproc_per_node=${NPROC_PER_NODE}"
   echo "start_time=$(date -Iseconds)"
@@ -108,6 +112,7 @@ megatron rlhf \
   --rlhf_type gkd \
   --model "${STUDENT_MODEL}" \
   --teacher_model "${TEACHER_MODEL}" \
+  --use_hf "${USE_HF}" \
   --tuner_type full \
   --dataset "${DATASET_EN}" "${DATASET_ZH}" \
   --torch_dtype bfloat16 \

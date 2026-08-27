@@ -30,6 +30,7 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 GRAD_ACC="${GRAD_ACC:-4}"
 SEED="${SEED:-42}"
+USE_HF="${USE_HF:-true}"
 
 # Prevent stale precision-isolation settings from changing a normal training run.
 unset SWIFT_GKD_ALIGNMENT_DEBUG_START_STEP
@@ -67,11 +68,13 @@ fi
 python - <<'PY'
 import torch
 import torch_npu
+from importlib.metadata import version
 
 print('PyTorch version:', torch.__version__)
 print('NPU available:', torch.npu.is_available())
 if not torch.npu.is_available():
     raise RuntimeError('No Ascend NPU is available.')
+print('mcore-bridge version:', version('mcore-bridge'))
 PY
 
 npu-smi info
@@ -88,6 +91,7 @@ npu-smi info
   echo "eval_batch_size=${EVAL_BATCH_SIZE}"
   echo "gradient_accumulation_steps=${GRAD_ACC}"
   echo "seed=${SEED}"
+  echo "use_hf=${USE_HF}"
   echo "visible_devices=${ASCEND_RT_VISIBLE_DEVICES}"
   echo "nproc_per_node=${NPROC_PER_NODE}"
   echo "start_time=$(date -Iseconds)"
@@ -107,6 +111,7 @@ megatron rlhf \
   --rlhf_type gkd \
   --model "${STUDENT_MODEL}" \
   --teacher_model "${TEACHER_MODEL}" \
+  --use_hf "${USE_HF}" \
   --tuner_type full \
   --dataset "${DATASET_EN}" "${DATASET_ZH}" \
   --torch_dtype bfloat16 \

@@ -203,6 +203,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             pattern.strip() for pattern in parameter_patterns.split(',') if pattern.strip()
         ]
         self._dlogits_module_gradients = {}
+        self._dlogits_provenance = None
         self._dlogits_hook_done = False
         if self._dlogits_isolation_mode not in {'', 'capture', 'replay'}:
             raise ValueError('SWIFT_GKD_DLOGITS_ISOLATION_MODE must be empty, "capture", or "replay".')
@@ -558,6 +559,37 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             and step == self._dlogits_isolation_step
             and micro_batch == self._dlogits_isolation_micro_batch
         )
+
+    def _capture_dlogits_provenance(self, data, labels, teacher_output, step, micro_batch):
+        if not self._is_dlogits_isolation_target(step, micro_batch):
+            return
+        if self._dlogits_provenance is not None:
+            raise RuntimeError('Common dLogits provenance was captured more than once.')
+        args = self.args
+        self._dlogits_provenance = {
+            'input_ids': self._tensor_identity(data.get('input_ids')),
+            'position_ids': self._tensor_identity(data.get('position_ids')),
+            'labels': self._tensor_identity(labels),
+            'num_valid': int((labels != -100).sum().item()) if labels is not None else None,
+            'teacher_logits': self._tensor_identity(teacher_output.full_logits),
+            'teacher_topk_logprobs': self._tensor_identity(teacher_output.topk_logprobs),
+            'teacher_topk_indices': self._tensor_identity(teacher_output.topk_indices),
+            'teacher_labels': self._tensor_identity(teacher_output.opsd_teacher_labels),
+            'runtime': {
+                key: getattr(args, key, None)
+                for key in (
+                    'tensor_model_parallel_size', 'pipeline_model_parallel_size',
+                    'context_parallel_size', 'micro_batch_size', 'global_batch_size',
+                    'padding_free', 'sequence_parallel', 'attention_backend', 'torch_dtype',
+                )
+            },
+            'checkpoint': {
+                key: str(getattr(args, key, None))
+                for key in ('model', 'load', 'finetune', 'no_load_optim', 'no_load_rng', 'seed', 'data_seed')
+            },
+            'student_parameter_probes': self._model_parameter_probe_summary(
+                self.unwrapped_models),
+        }
 
     def _register_dlogits_isolation_hook(self, output_tensor, step, micro_batch):
         if not self._is_dlogits_isolation_target(step, micro_batch) or self._dlogits_hook_done:
@@ -1884,6 +1916,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     map_location='cpu',
                     weights_only=True,
                 )['identity'],
+                'provenance': self._dlogits_provenance,
+                'backward_patterns': list(self._dlogits_backward_patterns),
                 'module_gradients': self._dlogits_module_gradients,
                 'parameter_gradient_samples': self._capture_dlogits_parameter_gradient_samples(),
             }, self._dlogits_isolation_output_path)
@@ -2439,6 +2473,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'call_counts': {},
             }
         self._attention_forward_trace.capture_provenance(
+            data, labels, teacher_output, step, micro_idx)
+        self._capture_dlogits_provenance(
             data, labels, teacher_output, step, micro_idx)
         try:
             student_output = model(**data)
