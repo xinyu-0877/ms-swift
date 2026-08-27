@@ -23,11 +23,20 @@ def compare(args):
     npu_mode = npu_payload.get('mode') if isinstance(npu_payload, dict) else None
     gpu_target = gpu_payload.get('target_prefix') if isinstance(gpu_payload, dict) else None
     npu_target = npu_payload.get('target_prefix') if isinstance(npu_payload, dict) else None
+    gpu_module_type = gpu_payload.get('module_type') if isinstance(gpu_payload, dict) else None
+    npu_module_type = npu_payload.get('module_type') if isinstance(npu_payload, dict) else None
+    gpu_qkv = gpu_payload.get('qkv') if isinstance(gpu_payload, dict) else None
+    npu_qkv = npu_payload.get('qkv') if isinstance(npu_payload, dict) else None
     invariants = {
         'gpu_is_replay': gpu_mode == 'replay',
         'npu_is_capture_or_replay': npu_mode in {'capture', 'replay'},
         'target_match': gpu_target == npu_target,
         'expected_target_match': args.expected_target is None or gpu_target == args.expected_target,
+        'gpu_module_type_supported': gpu_module_type in {'TEDotProductAttention', 'DotProductAttention'},
+        'npu_module_type_supported': npu_module_type in {'TEDotProductAttention', 'DotProductAttention'},
+        'qkv_present': isinstance(gpu_qkv, list) and isinstance(npu_qkv, list)
+        and len(gpu_qkv) == 3 and len(npu_qkv) == 3,
+        'common_qkv_match': gpu_qkv == npu_qkv,
         'numel_match': gpu.numel() == npu.numel(),
     }
     failed = [name for name, value in invariants.items() if not value]
@@ -47,6 +56,11 @@ def compare(args):
     result = {
         'invariants': invariants,
         'target_prefix': gpu_target,
+        'gpu_module_type': gpu_module_type,
+        'npu_module_type': npu_module_type,
+        'common_qkv_identity': {
+            name: identity for name, identity in zip(('query', 'key', 'value'), gpu_qkv)
+        },
         'gpu_shape': list(gpu.shape),
         'npu_shape': list(npu.shape),
         'numel': gpu.numel(),
@@ -66,11 +80,23 @@ def compare(args):
     }
     with open(args.output, 'w', encoding='utf-8') as file:
         json.dump(result, file, ensure_ascii=False, indent=2)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(f'Full report: {args.output}')
+    print(f'Target: {gpu_target} (GPU={gpu_module_type}, NPU={npu_module_type})')
+    print(f'Invariants: all passed ({len(invariants)})')
+    print('Common Q/K/V: matched')
+    for name, identity in result['common_qkv_identity'].items():
+        print(
+            f'  {name}: shape={identity["shape"]} dtype={identity["dtype"]} '
+            f'sha256={identity["sha256"]}')
+    print(f'Output shapes: GPU={list(gpu.shape)}, NPU={list(npu.shape)}, numel={gpu.numel()}')
+    print(f'relative_l2: {result["relative_l2"]:.9%}')
+    print(f'cosine: {result["cosine"]:.12f}')
+    print(f'max_abs: {result["max_abs"]:.12g}')
+    print(f'norms: GPU={result["gpu_norm"]:.12g}, NPU={result["npu_norm"]:.12g}')
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Compare isolated GPU/NPU Flash Attention outputs.')
+    parser = argparse.ArgumentParser(description='Compare common-QKV GPU/NPU core-attention outputs.')
     parser.add_argument('--gpu', required=True)
     parser.add_argument('--npu', required=True)
     parser.add_argument('--output', required=True)

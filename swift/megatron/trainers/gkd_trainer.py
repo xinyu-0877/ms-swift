@@ -1540,6 +1540,11 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         output_tensor = self._first_tensor(output)
         if output_tensor is None:
             raise ValueError('Unable to capture the Flash Attention output tensor.')
+        runtime_tensors = self._flash_direct_tensors(args, kwargs)
+        if len(runtime_tensors) < 3:
+            raise ValueError(
+                f'Flash Attention isolation expected Q/K/V tensors at output capture, '
+                f'found {len(runtime_tensors)}.')
         output_path = self._flash_isolation_output_path(output_tensor)
         torch.save({
             'output': output_tensor.detach().cpu(),
@@ -1547,6 +1552,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'dtype': str(output_tensor.dtype),
             'mode': self._flash_isolation_mode,
             'target_prefix': self._flash_isolation_prefix,
+            'module_type': type(module).__name__,
+            'qkv': [self._tensor_identity(item['tensor']) for item in runtime_tensors[:3]],
         }, output_path)
         self._flash_isolation_done = True
         logger.info(f'Saved isolated Flash Attention output: {output_path}')
