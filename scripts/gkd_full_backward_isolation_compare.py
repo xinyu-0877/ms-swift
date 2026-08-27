@@ -162,10 +162,21 @@ def main():
             'model0.output_layer', 'model0.decoder.final_layernorm',
             *(f'model0.decoder.layers.{index}' for index in range(28)),
         }
-        invariants['all_layer_boundaries_present'] = set(gpu_modules) == expected_names
+        gpu_module_names = set(gpu_modules)
+        npu_module_names = set(npu_modules)
+        missing_gpu = sorted(expected_names - gpu_module_names)
+        missing_npu = sorted(expected_names - npu_module_names)
+        extra_gpu = sorted(gpu_module_names - expected_names)
+        extra_npu = sorted(npu_module_names - expected_names)
+        # Other enabled backward-debug patterns may legitimately add captures.
+        # Only the 30 boundaries used by --all-layers are mandatory here.
+        invariants['all_layer_boundaries_present'] = not missing_gpu and not missing_npu
     failed = [name for name, passed in invariants.items() if not passed]
     if failed:
-        raise ValueError(f'Common-dLogits backward invariants failed: {failed}.')
+        detail = ''
+        if args.all_layers and not invariants.get('all_layer_boundaries_present', True):
+            detail = f' missing_gpu={missing_gpu}, missing_npu={missing_npu}.'
+        raise ValueError(f'Common-dLogits backward invariants failed: {failed}.{detail}')
 
     result = {
         'invariants': invariants,
@@ -176,6 +187,15 @@ def main():
         'parameter_gradient_samples': parameters,
     }
     if args.all_layers:
+        result['all_layer_boundary_inventory'] = {
+            'expected_count': len(expected_names),
+            'gpu_count': len(gpu_modules),
+            'npu_count': len(npu_modules),
+            'missing_gpu': missing_gpu,
+            'missing_npu': missing_npu,
+            'extra_gpu': extra_gpu,
+            'extra_npu': extra_npu,
+        }
         chain = [{
             'label': 'common_dlogits',
             'module': None,
@@ -246,6 +266,12 @@ def main():
         saved_path = args.output or 'not saved (--output omitted)'
         print(f'Full report: {saved_path}')
         print(f'Invariants: all passed ({len(invariants)})')
+        inventory = result['all_layer_boundary_inventory']
+        print(
+            f'Module inventory: expected={inventory["expected_count"]}, '
+            f'gpu={inventory["gpu_count"]}, npu={inventory["npu_count"]}')
+        if inventory['extra_gpu']:
+            print(f'Ignored extra matched modules: {inventory["extra_gpu"]}')
         print('\nCommon-dLogits backward chain:')
         print('boundary                         rel_l2     delta_pp          cos  crossed_module')
         for item in result['backward_chain']:
