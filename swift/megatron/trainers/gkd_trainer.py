@@ -32,6 +32,7 @@ from .gkd_microbatch_backward_debug import GKDMicrobatchBackwardTrace
 from .gkd_utils import cp_reduce, tp_gather_topk, vocab_parallel_topk
 from .gkd_mlp_merge_debug import GKDMLPMergeIsolation
 from .gkd_self_attention_forward_debug import GKDSelfAttentionForwardIsolation
+from .gkd_runtime_audit import write_runtime_audit
 from .rlhf_mixin import MegatronRLHFTrainer
 from .rollout_mixin import MegatronRolloutMixin
 from .utils import load_megatron_model_to_gpu, offload_megatron_model_to_cpu
@@ -2480,6 +2481,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             student_output = model(**data)
         finally:
             self._operator_debug_context = None
+        write_runtime_audit(self, model, data, labels, teacher_output.full_logits, step, micro_idx)
         if (self._flash_isolation_mode
                 and step == self._flash_isolation_step
                 and micro_idx == self._flash_isolation_micro_batch
