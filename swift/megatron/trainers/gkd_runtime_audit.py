@@ -100,6 +100,13 @@ def write_runtime_audit(trainer, model, data, labels, teacher_logits, step, micr
         ddp = getattr(getattr(model, 'module', None), 'ddp_config', None)
     if ddp is None:
         ddp = getattr(trainer, 'ddp_config', None)
+    grad_dtypes = {}
+    for name, param in model.named_parameters():
+        if any(pattern in name for pattern in param_patterns):
+            grad = getattr(param, 'main_grad', None)
+            if grad is None:
+                grad = param.grad
+            grad_dtypes[name] = str(grad.dtype) if grad is not None else None
     audit = {
         'step': step, 'micro_batch': micro_idx,
         'device': str(next(model.parameters()).device),
@@ -115,6 +122,7 @@ def write_runtime_audit(trainer, model, data, labels, teacher_logits, step, micr
             'accumulate_allreduce_grads_in_fp32')},
         'effective_ddp': {key: str(getattr(ddp, key, None)) for key in (
             'grad_reduce_in_fp32', 'overlap_grad_reduce', 'align_grad_reduce')},
+        'effective_main_grad_dtypes': grad_dtypes,
         'inputs': {key: _digest(data.get(key), stats=False) for key in ('input_ids', 'position_ids')},
         'labels': _digest(labels),
         'num_valid': int((labels != -100).sum().item()) if labels is not None else None,
@@ -130,3 +138,26 @@ def write_runtime_audit(trainer, model, data, labels, teacher_logits, step, micr
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     Path(output).write_text(json.dumps(audit, indent=2, sort_keys=True), encoding='utf-8')
     trainer._runtime_audit_written = True
+
+
+def update_runtime_audit_grad_dtypes(trainer, model):
+    """Add pre-optimizer gradient dtypes to the one-shot audit file."""
+    output = os.getenv('SWIFT_GKD_RUNTIME_AUDIT_PATH')
+    if not output or not getattr(trainer, '_runtime_audit_written', False):
+        return
+    path = Path(output)
+    if not path.exists():
+        return
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    patterns = [p.strip() for p in os.getenv(
+        'SWIFT_GKD_RUNTIME_AUDIT_PARAMETER_PATTERNS', '').split(',') if p.strip()]
+    dtypes = {}
+    for name, param in model.named_parameters():
+        if patterns and not any(pattern in name for pattern in patterns):
+            continue
+        grad = getattr(param, 'main_grad', None)
+        if grad is None:
+            grad = param.grad
+        dtypes[name] = str(grad.dtype) if grad is not None else None
+    payload['pre_optimizer_grad_dtypes'] = dtypes
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8')

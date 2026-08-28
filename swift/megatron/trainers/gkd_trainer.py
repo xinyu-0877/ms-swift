@@ -32,7 +32,7 @@ from .gkd_microbatch_backward_debug import GKDMicrobatchBackwardTrace
 from .gkd_utils import cp_reduce, tp_gather_topk, vocab_parallel_topk
 from .gkd_mlp_merge_debug import GKDMLPMergeIsolation
 from .gkd_self_attention_forward_debug import GKDSelfAttentionForwardIsolation
-from .gkd_runtime_audit import write_runtime_audit
+from .gkd_runtime_audit import update_runtime_audit_grad_dtypes, write_runtime_audit
 from .rlhf_mixin import MegatronRLHFTrainer
 from .rollout_mixin import MegatronRolloutMixin
 from .utils import load_megatron_model_to_gpu, offload_megatron_model_to_cpu
@@ -44,6 +44,12 @@ logger = get_logger()
 class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def __init__(self, args: MegatronArguments, template, **kwargs):
+        # Controlled runtime audit: disable activation recomputation before the
+        # base trainer constructs the model/configuration.
+        if os.getenv('SWIFT_GKD_AUDIT_DISABLE_CORE_ATTN_RECOMPUTE', '0') == '1':
+            args.recompute_granularity = 'none'
+            args.recompute_modules = []
+            logger.info('GKD runtime audit: core attention recompute disabled')
         self.vllm_client = kwargs.pop('vllm_client', None)
 
         # GKD-specific parameters
@@ -493,6 +499,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def _before_optimizer_step(self):
         step = int(self.state.iteration)
+        if step == int(os.getenv('SWIFT_GKD_RUNTIME_AUDIT_STEP', '0')):
+            update_runtime_audit_grad_dtypes(self, self.wrapped_models[0])
         if step in self._preclip_grad_steps and self._is_preclip_grad_capture_rank():
             self._capture_preclip_gradients(step)
 
