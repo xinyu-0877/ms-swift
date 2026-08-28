@@ -47,7 +47,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         # Controlled runtime audit: disable activation recomputation before the
         # base trainer constructs the model/configuration.
         if os.getenv('SWIFT_GKD_AUDIT_DISABLE_CORE_ATTN_RECOMPUTE', '0') == '1':
-            args.recompute_granularity = 'none'
+            # Megatron TransformerConfig expects None for disabled recompute;
+            # the CLI spelling "none" is normalized earlier during argument parsing.
+            args.recompute_granularity = None
             args.recompute_modules = []
             logger.info('GKD runtime audit: core attention recompute disabled')
         self.vllm_client = kwargs.pop('vllm_client', None)
