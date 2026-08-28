@@ -155,6 +155,15 @@ class GKDAttentionForwardTrace:
             }
             self.payload['runtime']['world_size'] = world_size
             self.payload['runtime']['data_parallel_size'] = world_size // model_parallel_size
+            fp32_residual_connection = bool(
+                getattr(self.trainer.config, 'fp32_residual_connection', False))
+            self.payload['runtime']['fp32_residual_connection'] = fp32_residual_connection
+            if (os.getenv('SWIFT_GKD_REQUIRE_FP32_RESIDUAL', '0') == '1'
+                    and not fp32_residual_connection):
+                raise ValueError(
+                    'FP32 residual experiment requested, but runtime ModelConfig has '
+                    'fp32_residual_connection=False. Pass '
+                    '--megatron_extra_kwargs \'{"fp32_residual_connection": true}\'.')
 
     def capture_provenance(self, data, labels, teacher_output, step, micro_batch):
         if (not self.enabled or not self.trainer._is_debug_rank()

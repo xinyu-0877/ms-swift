@@ -161,6 +161,12 @@ def print_summary(result, output_path, material_increase, top_k):
     print(f'Full report: {saved_path}')
     print(f'Scope: {result["scope"]}')
     print(f'Invariants: all passed ({len(result["invariants"])})')
+    runtime = result.get('runtime', {}).get('gpu', {})
+    print(
+        'Runtime: '
+        f'fp32_residual_connection={runtime.get("fp32_residual_connection")}, '
+        f'torch_dtype={runtime.get("torch_dtype")}, '
+        f'padding_free={runtime.get("padding_free")}')
 
     if result['scope'] == 'layer':
         print('\nA-G boundaries:')
@@ -286,6 +292,10 @@ def main():
         'checkpoint_provenance': {
             'gpu': gpu.get('checkpoint_provenance'),
             'npu': npu.get('checkpoint_provenance'),
+        },
+        'runtime': {
+            'gpu': gpu.get('runtime'),
+            'npu': npu.get('runtime'),
         },
         'nodes': nodes,
     }
