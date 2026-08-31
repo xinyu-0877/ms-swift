@@ -43,12 +43,13 @@ bash scripts/sft_layer0_ag_compare.sh \
 报告使用完整 tensor 的 `relative_l2`、cosine、`max_abs`，并在比较前校验
 `input_ids`、`position_ids`、labels、有效 token 数以及参数 probe。attention backend
 名称允许不同，因为 GPU 和 NPU 的实际 kernel 栈本来就不同；其余运行配置会记录在
-payload 中供人工复核。
+payload 中供人工复核。参数 probe 不一致时，比较器默认继续输出 A-G 结果，但会明确
+标记这些结果同时包含权重差异和 backend 差异。
 
 参数 probe 的比较按参数名匹配，不依赖两端记录顺序；dtype 差异只作为 warning，
-采样值仍统一转换为 FP32 后比较。如果确实确认两端使用的 checkpoint 不同，只为定位
-查看 A-G 数值时可显式加入 `--allow-parameter-probe-mismatch`，报告会保留 mismatch；
-这种结果不能作为严格的同参数算子对齐结论。
+采样值仍统一转换为 FP32 后比较。如果需要严格的同参数校验，可加入
+`--strict-parameters`；旧参数 `--allow-parameter-probe-mismatch` 仍兼容。参数不一致
+时的结果不能作为严格的同参数算子对齐结论。
 
 如果只想把现有 SFT 脚本改成诊断运行，可以在 `megatron sft` 前加入：
 

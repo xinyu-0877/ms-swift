@@ -129,7 +129,9 @@ def main():
     parser.add_argument('--allow-provenance-mismatch', action='store_true',
                         help='Do not fail when input/checkpoint provenance differs')
     parser.add_argument('--allow-parameter-probe-mismatch', action='store_true',
-                        help='Continue and report A-G metrics when parameter probes differ')
+                        help='Deprecated alias: continue and report A-G metrics when parameters differ')
+    parser.add_argument('--strict-parameters', action='store_true',
+                        help='Fail instead of warning when parameter probes differ')
     args = parser.parse_args()
 
     gpu = torch.load(args.gpu, map_location='cpu', weights_only=True)
@@ -154,16 +156,23 @@ def main():
         gpu_runtime.get(key) == npu_runtime.get(key) for key in runtime_keys)
     invariants.update(_provenance_invariants(gpu, npu))
     probe_checks = invariants.pop('_parameter_probe_checks')
-    provenance_failures = {
+    provenance_keys = {
         'input_ids_match', 'position_ids_match', 'labels_match', 'num_valid_match',
-        'parameter_probes_match', 'parameter_probe_names_match',
-        'parameter_probe_values_match', 'provenance_present',
+        'provenance_present',
     }
-    if args.allow_parameter_probe_mismatch:
-        provenance_failures.update({
-            'parameter_probes_match', 'parameter_probe_names_match', 'parameter_probe_values_match'})
+    parameter_keys = {
+        'parameter_probes_match', 'parameter_probe_names_match',
+        'parameter_probe_values_match',
+    }
+    # Native A-G comparison remains useful when the independently launched
+    # GPU/NPU jobs loaded slightly different weights, but it must be labeled
+    # accordingly. Strict same-parameter operator isolation is opt-in.
+    allow_parameter_mismatch = not args.strict_parameters or args.allow_parameter_probe_mismatch
     failed = [key for key, value in invariants.items()
-              if not value and (not args.allow_provenance_mismatch or key not in provenance_failures)]
+              if not value and (
+                  (key in provenance_keys and not args.allow_provenance_mismatch)
+                  or (key in parameter_keys and not allow_parameter_mismatch)
+                  or (key not in provenance_keys and key not in parameter_keys))]
     if failed:
         detail = ''
         if 'parameter_probe_values_match' in failed:
@@ -188,6 +197,19 @@ def main():
         'module_types': {'gpu': gpu.get('module_types'), 'npu': npu.get('module_types')},
         'nodes': nodes,
         'parameter_probe_checks': probe_checks,
+        'interpretation': {
+            'same_parameter_values': bool(invariants.get('parameter_probe_values_match')),
+            'native_a_g_operator_isolation_valid': bool(
+                invariants.get('parameter_probe_values_match')
+                and invariants.get('input_ids_match')
+                and invariants.get('position_ids_match')
+                and invariants.get('labels_match')),
+            'note': (
+                'Parameter probes differ; A-G metrics include both weight and backend effects. '
+                'Use common-parameter replay before attributing an error to an operator.'
+                if not invariants.get('parameter_probe_values_match') else
+                'Inputs and parameter probes match; A-G metrics are suitable for native cross-backend comparison.'),
+        },
     }
     text = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
@@ -210,7 +232,9 @@ def main():
     if not invariants.get('parameter_probe_dtypes_match', True):
         print('Warning: GPU/NPU parameter storage dtypes differ; values were compared after FP32 conversion.')
     if probe_checks['value_mismatches']:
-        print(f'Parameter probe value mismatches: {len(probe_checks["value_mismatches"])}')
+        names = [item.get('name') for item in probe_checks['value_mismatches']]
+        print(f'Warning: parameter probe values differ for {len(names)} parameters: {names}')
+        print('A-G metrics include weight differences; use common-parameter replay for operator attribution.')
 
 
 if __name__ == '__main__':
