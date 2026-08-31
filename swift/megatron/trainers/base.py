@@ -41,6 +41,7 @@ from swift.trainers.utils import patch_modelscope_hub_timeout
 from swift.utils import (deep_getattr, gc_collect, get_current_device, get_last_valid_indices, get_logger, is_last_rank,
                          is_master, ms_logger_context)
 from .batch_sampler import MegatronPretrainingRandomSampler, MegatronPretrainingSampler
+from .sft_attention_forward_debug import SFTAttentionForwardTrace
 from .utils import TrainerState, build_streaming_dataloader, prepare_batch
 
 try:
@@ -118,6 +119,12 @@ class BaseMegatronTrainer(ABC):
             self.state.iteration = load_mcore_checkpoint(
                 args, self.wrapped_models, self.optimizer, self.opt_param_scheduler, load_arg='mcore_adapter')
         self.state.consumed_train_samples = getattr(args, 'consumed_train_samples', 0)
+
+        # Optional ordinary-SFT forward tracing.  GKD has its own richer
+        # tracer; this one is intentionally independent of teacher/loss code.
+        self._sft_attention_forward_trace = SFTAttentionForwardTrace(self)
+        if self._sft_attention_forward_trace.enabled:
+            self._sft_attention_forward_trace.register_hooks()
 
     def call_event(self, event, **kwargs):
         for callback in self.callbacks:
@@ -895,6 +902,8 @@ class BaseMegatronTrainer(ABC):
 
     def train_step(self, train_data_iterator):
         args = self.args
+        step = int(self.state.iteration)
+        self._sft_attention_forward_trace.prepare_train_step(step, args.num_microbatches)
         forward_backward_func = get_forward_backward_func()
         for m in self.wrapped_models:
             m.zero_grad_buffer()
@@ -905,15 +914,18 @@ class BaseMegatronTrainer(ABC):
         if self.enable_routing_replay:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
-        metrics = forward_backward_func(
-            forward_step_func=self.forward_step,
-            data_iterator=data_iterator,
-            model=self.wrapped_models,
-            num_microbatches=args.num_microbatches,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            forward_only=False,
-        )
+        try:
+            metrics = forward_backward_func(
+                forward_step_func=self.forward_step,
+                data_iterator=data_iterator,
+                model=self.wrapped_models,
+                num_microbatches=args.num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                forward_only=False,
+            )
+        finally:
+            self._sft_attention_forward_trace.finalize_train_step(step)
 
         self._before_optimizer_step()
         update_successful, grad_norm, _ = self.optimizer.step()

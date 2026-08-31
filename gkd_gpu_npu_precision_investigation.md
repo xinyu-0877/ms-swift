@@ -907,3 +907,78 @@ Ascend 环境安装 NVIDIA Transformer Engine。
 
 原始训练 step 13 的 48% 事件仍需恢复完整训练状态后单独复现，不能用当前 Base/step 0
 或 checkpoint-13 fresh runtime step 0 的结果直接替代。
+
+## 15. 2026-08-31 CPU 基线与 NPU 算子复核
+
+本轮验证在 `swift-ascend` 容器内完成，操作范围限定为 `/workspace/ms-swift` 和
+`/data/gkd_megatron`。容器内未找到精确路径 `/data/megatron_test`，因此使用
+`/data/gkd_megatron` 中已有的公共输入和 NPU capture。CPU 运行通过
+`TORCH_DEVICE_BACKEND_AUTOLOAD=0` 禁止加载 `torch_npu`。
+
+### 15.1 JSD 公共输入
+
+输入：
+
+```text
+/data/gkd_megatron/jsd_isolation/jsd_inputs_step_000013_micro_001.pt
+```
+
+两端使用相同 student logits、teacher logits 和 labels，且 `step=13`、
+`micro_batch=1`。
+
+| 模式 | CPU loss | NPU loss | 绝对差 | 相对差 | dStudentLogits relative_l2 |
+|---|---:|---:|---:|---:|---:|
+| BF16 | 1.0611157417 | 1.0624607801 | 0.0013450384 | 0.126596% | 0.234666% |
+| FP32 JSD | 1.0617146492 | 1.0616934299 | 0.0000212193 | 0.001999% | 0.016836% |
+
+结果文件：
+
+```text
+/data/gkd_megatron/jsd_isolation/jsd_cpu_npu_compare.json
+/data/gkd_megatron/jsd_isolation/jsd_cpu_npu_fp32_compare.json
+```
+
+结论：在公共输入下，JSD 的 BF16 `exp/log/logsumexp` 路径存在可测的 CPU/NPU
+局部差异。启用 `SWIFT_GKD_JSD_FP32=1` 后，loss 相对差下降约 63 倍，
+dStudentLogits relative L2 下降约 14 倍。该结果支持 FP32 JSD 作为缓解选项，
+但尚未证明它能够消除整网训练轨迹分叉，因此本轮没有修改训练脚本默认配置。
+
+### 15.2 Layer 6 FC1/RMSNorm 公共边界
+
+NPU capture 和公共输入：
+
+```text
+/data/gkd_megatron/layer6_fc1_backward/fc1_module_common.pt
+/data/gkd_megatron/layer6_fc1_backward/fc1_module_npu_capture.pt
+```
+
+CPU 参考实现为 FP32 RMSNorm 统计、BF16 归一化结果和 BF16 linear，由
+`scripts/gkd_cpu_fc1_baseline.py` 执行。CPU 与 NPU 使用相同输入、参数和
+`output.0` 上游梯度。
+
+| 边界 | relative_l2 | max_abs | cosine |
+|---|---:|---:|---:|
+| FC1 forward output | 0.006657% | 0.015625 | 0.9999999978 |
+| local input gradient | 0.283396% | 6.1035e-05 | 0.9999959844 |
+| FC1 weight gradient | 0.001778% | 6.1035e-05 | 0.9999999998 |
+| RMSNorm weight gradient | 0% | 0 | 1 |
+
+报告：
+
+```text
+/data/gkd_megatron/layer6_fc1_backward/cpu_npu_fc1_compare.json
+```
+
+结论：Layer 6 FC1/RMSNorm 在共同输入、共同参数、共同 dout 下没有达到 1% 的
+局部误差阈值，不支持将当前整网反向误差增长归因于该算子。该结果与已有的
+SwiGLU 公共输入测试一致，SwiGLU forward 的 CPU/NPU `relative_l2=0`。
+
+### 15.3 当前判断与下一步
+
+1. JSD BF16 数值路径是目前已确认的局部 NPU 精度差异源，FP32 JSD 能显著降低该差异。
+2. Layer 6 FC1/RMSNorm 与 SwiGLU 没有发现百分比级局部异常。
+3. 仍不能据此断言整网 NPU 训练误差已解决；BF16 前向激活传播、Attention 以及多层
+   反向累积仍需按共同 activation、parameter、dout 边界分析。
+4. 下一次 A/B 应在相同 GKD 单步脚本中同时设置 `SWIFT_GKD_JSD_FP32=1`，比较
+   student logits、loss、pre-clip gradient 和后续参数增量；不要混用 BF16 与 FP32
+   的 capture。

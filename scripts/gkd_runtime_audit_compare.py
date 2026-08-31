@@ -4,11 +4,19 @@ from pathlib import Path
 
 
 def _load_json(path):
+    if not path:
+        return None
+    if not Path(path).exists():
+        print(f'WARNING: optional file not found, skipped: {path}')
+        return None
     return json.loads(Path(path).read_text(encoding='utf-8'))
 
 
 def _step_loss(path, step=0):
     if not path:
+        return None
+    if not Path(path).exists():
+        print(f'WARNING: optional alignment file not found, skipped: {path}')
         return None
     for line in Path(path).read_text(encoding='utf-8').splitlines():
         try:
@@ -37,6 +45,8 @@ def _extract_forward(path):
     if not path:
         return {}
     data = _load_json(path)
+    if data is None:
+        return {}
     result = {}
     for row in data.get('layers', data.get('layer_boundaries', [])):
         label = row.get('layer', row.get('label'))
@@ -54,6 +64,8 @@ def _extract_backward(path):
     if not path:
         return {}
     data = _load_json(path)
+    if data is None:
+        return {}
     return {str(row.get('boundary')): row.get('rel_l2')
             for row in data.get('boundaries', data.get('chain', []))
             if row.get('boundary') is not None and row.get('rel_l2') is not None}

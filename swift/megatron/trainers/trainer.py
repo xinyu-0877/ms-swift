@@ -111,6 +111,11 @@ class MegatronTrainer(BaseMegatronTrainer):
         labels = data.get('labels')
         if self.args.task_type == 'seq_cls':
             data.pop('labels', None)
+        trace = self._sft_attention_forward_trace
+        if trace.enabled:
+            # SFT tracing is restricted to one micro-batch, so the base
+            # train_step establishes the matching step-0 context.
+            trace.capture_provenance(data, labels, int(self.state.iteration), trace.micro_batch)
         output_tensor = model(**data)
         packed_seq_params = data.get('packed_seq_params')
         if self.args.task_type == 'seq_cls':
