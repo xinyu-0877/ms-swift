@@ -57,6 +57,43 @@ def compare_maps(gpu_values, npu_values):
     return result
 
 
+def _probe_map(probes):
+    """Index probes by name so list ordering cannot create a false mismatch."""
+    return {probe.get('name'): probe for probe in probes if probe.get('name')}
+
+
+def _parameter_probe_checks(gpu, npu):
+    gpu_probes = _probe_map(gpu.get('provenance', {}).get('student_parameter_probes', []))
+    npu_probes = _probe_map(npu.get('provenance', {}).get('student_parameter_probes', []))
+    names_match = set(gpu_probes) == set(npu_probes)
+    value_mismatches = []
+    dtype_mismatches = []
+    for name in sorted(set(gpu_probes) | set(npu_probes)):
+        gp = gpu_probes.get(name)
+        np = npu_probes.get(name)
+        if gp is None or np is None:
+            value_mismatches.append({'name': name, 'gpu_present': gp is not None,
+                                     'npu_present': np is not None})
+            continue
+        comparable = ('shape', 'numel', 'sample_indices', 'sample_sha256_fp32')
+        if any(gp.get(key) != np.get(key) for key in comparable):
+            value_mismatches.append({
+                'name': name,
+                'gpu': {key: gp.get(key) for key in comparable},
+                'npu': {key: np.get(key) for key in comparable},
+            })
+        if gp.get('dtype') != np.get('dtype'):
+            dtype_mismatches.append({
+                'name': name, 'gpu': gp.get('dtype'), 'npu': np.get('dtype')})
+    return {
+        'names_match': names_match,
+        'values_match': not value_mismatches,
+        'dtypes_match': not dtype_mismatches,
+        'value_mismatches': value_mismatches,
+        'dtype_mismatches': dtype_mismatches,
+    }
+
+
 def _provenance_invariants(gpu, npu):
     gp = gpu.get('provenance', {})
     np = npu.get('provenance', {})
@@ -67,10 +104,16 @@ def _provenance_invariants(gpu, npu):
         'labels_match': gp.get('labels') == np.get('labels'),
         'num_valid_match': gp.get('num_valid') == np.get('num_valid'),
     }
-    # The probe list is a compact checkpoint sanity check.  The full model
-    # checkpoint and optimizer state are still recorded separately in payload.
+    probe_checks = _parameter_probe_checks(gpu, npu)
+    # Parameter values are a hard invariant. Dtype is reported separately:
+    # some backends expose the same loaded values through different storage
+    # dtypes, which should not make the A-G report fail before tensor metrics.
+    invariants['parameter_probe_names_match'] = probe_checks['names_match']
+    invariants['parameter_probe_values_match'] = probe_checks['values_match']
+    invariants['parameter_probe_dtypes_match'] = probe_checks['dtypes_match']
     invariants['parameter_probes_match'] = (
-        gp.get('student_parameter_probes', []) == np.get('student_parameter_probes', []))
+        probe_checks['names_match'] and probe_checks['values_match'])
+    invariants['_parameter_probe_checks'] = probe_checks
     return invariants
 
 
@@ -85,6 +128,8 @@ def main():
     parser.add_argument('--output', help='Optional JSON report path')
     parser.add_argument('--allow-provenance-mismatch', action='store_true',
                         help='Do not fail when input/checkpoint provenance differs')
+    parser.add_argument('--allow-parameter-probe-mismatch', action='store_true',
+                        help='Continue and report A-G metrics when parameter probes differ')
     args = parser.parse_args()
 
     gpu = torch.load(args.gpu, map_location='cpu', weights_only=True)
@@ -108,14 +153,23 @@ def main():
     invariants['runtime_compatible'] = all(
         gpu_runtime.get(key) == npu_runtime.get(key) for key in runtime_keys)
     invariants.update(_provenance_invariants(gpu, npu))
+    probe_checks = invariants.pop('_parameter_probe_checks')
     provenance_failures = {
         'input_ids_match', 'position_ids_match', 'labels_match', 'num_valid_match',
-        'parameter_probes_match', 'provenance_present',
+        'parameter_probes_match', 'parameter_probe_names_match',
+        'parameter_probe_values_match', 'provenance_present',
     }
+    if args.allow_parameter_probe_mismatch:
+        provenance_failures.update({
+            'parameter_probes_match', 'parameter_probe_names_match', 'parameter_probe_values_match'})
     failed = [key for key, value in invariants.items()
               if not value and (not args.allow_provenance_mismatch or key not in provenance_failures)]
     if failed:
-        raise ValueError(f'SFT A-G invariants failed: {failed}')
+        detail = ''
+        if 'parameter_probe_values_match' in failed:
+            names = [item.get('name') for item in probe_checks['value_mismatches'][:8]]
+            detail = f' parameter_probe_value_mismatches={names}'
+        raise ValueError(f'SFT A-G invariants failed: {failed}.{detail}')
 
     nodes = {
         node: compare_maps(gpu['nodes'][node], npu['nodes'][node])
@@ -133,6 +187,7 @@ def main():
         },
         'module_types': {'gpu': gpu.get('module_types'), 'npu': npu.get('module_types')},
         'nodes': nodes,
+        'parameter_probe_checks': probe_checks,
     }
     text = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
@@ -152,6 +207,10 @@ def main():
               f'{metric["cosine"]:.9f} {metric["max_abs"]:.8g}')
     if args.output:
         print(f'Full report: {args.output}')
+    if not invariants.get('parameter_probe_dtypes_match', True):
+        print('Warning: GPU/NPU parameter storage dtypes differ; values were compared after FP32 conversion.')
+    if probe_checks['value_mismatches']:
+        print(f'Parameter probe value mismatches: {len(probe_checks["value_mismatches"])}')
 
 
 if __name__ == '__main__':

@@ -45,6 +45,11 @@ bash scripts/sft_layer0_ag_compare.sh \
 名称允许不同，因为 GPU 和 NPU 的实际 kernel 栈本来就不同；其余运行配置会记录在
 payload 中供人工复核。
 
+参数 probe 的比较按参数名匹配，不依赖两端记录顺序；dtype 差异只作为 warning，
+采样值仍统一转换为 FP32 后比较。如果确实确认两端使用的 checkpoint 不同，只为定位
+查看 A-G 数值时可显式加入 `--allow-parameter-probe-mismatch`，报告会保留 mismatch；
+这种结果不能作为严格的同参数算子对齐结论。
+
 如果只想把现有 SFT 脚本改成诊断运行，可以在 `megatron sft` 前加入：
 
 ```bash
@@ -53,4 +58,3 @@ source scripts/sft_attention_forward_env.sh /data/sft_megatron_alignment/trace g
 
 同时把该次运行改为一个 micro-batch。环境脚本只注册 hooks，不会替代原有的
 `megatron sft` 命令。
-
