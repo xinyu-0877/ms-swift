@@ -88,6 +88,25 @@ fi
 source "${REPO_ROOT}/scripts/sft_attention_forward_env.sh" \
     "${TRACE_DIR}" "${PLATFORM}_step0" decoder.layers.0
 
+python - <<'PY'
+import os
+from pathlib import Path
+
+required = {
+    'SWIFT_SFT_ATTENTION_FORWARD_TRACE': '1',
+    'SWIFT_SFT_ATTENTION_FORWARD_DIR': None,
+    'SWIFT_SFT_ATTENTION_FORWARD_TAG': None,
+}
+for key, expected in required.items():
+    value = os.environ.get(key)
+    if not value or (expected is not None and value != expected):
+        raise RuntimeError(f'{key} is not configured: {value!r}')
+print('Verified SFT trace environment:', {
+    key: os.environ[key] for key in required
+})
+PY
+python "${REPO_ROOT}/scripts/check_sft_attention_trace_install.py"
+
 LOG_FILE="${RUN_DIR}/logs/train.log"
 {
     echo "platform=${PLATFORM}"
@@ -169,4 +188,3 @@ if [[ ! -f "${TRACE_FILE}" ]]; then
     exit 1
 fi
 echo "Capture completed: ${TRACE_FILE}"
-

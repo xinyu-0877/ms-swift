@@ -57,5 +57,15 @@ payload 中供人工复核。参数 probe 不一致时，比较器默认继续�
 source scripts/sft_attention_forward_env.sh /data/sft_megatron_alignment/trace gpu_step0 decoder.layers.0
 ```
 
+确认服务器代码已同步后，可在同一 shell 中运行：
+
+```bash
+python scripts/check_sft_attention_trace_install.py
+```
+
+该检查必须显示四项均为 `True`。如果提示 integration incomplete，需要同步
+`swift/megatron/trainers/base.py`、`trainer.py` 和
+`sft_attention_forward_debug.py`，仅同步环境脚本不会注册 hooks。
+
 同时把该次运行改为一个 micro-batch。环境脚本只注册 hooks，不会替代原有的
 `megatron sft` 命令。

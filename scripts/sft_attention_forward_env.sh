@@ -22,5 +22,8 @@ export SWIFT_SFT_ATTENTION_FORWARD_LAYER_TARGET="${_sft_attention_layer}"
 export SWIFT_SFT_ATTENTION_FORWARD_STEP=0
 export SWIFT_SFT_ATTENTION_FORWARD_MICRO_BATCH=0
 
-unset _sft_attention_dir _sft_attention_tag _sft_attention_layer
+echo "SFT Layer-0 A-G trace enabled: dir=${SWIFT_SFT_ATTENTION_FORWARD_DIR}, "\
+     "tag=${SWIFT_SFT_ATTENTION_FORWARD_TAG}, "\
+     "layer=${SWIFT_SFT_ATTENTION_FORWARD_LAYER_TARGET}, step=0, micro_batch=0"
 
+unset _sft_attention_dir _sft_attention_tag _sft_attention_layer
