@@ -659,6 +659,27 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'values': sample_logits.tolist(),
             'norm': selected.float().norm().item(),
         }
+        # Aggregate over valid tokens so GPU/NPU logs remain comparable even
+        # when the first valid position or sequence lengths differ.
+        if labels is not None:
+            valid = labels != -100
+            if valid.shape[:2] == logits.shape[:2] and valid.any():
+                valid_logits = logits[valid].detach().float()
+                flat_labels = labels[valid].detach().long().clamp_(0, vocab_size - 1)
+                valid_log_probs = torch.log_softmax(valid_logits, dim=-1)
+                target_log_probs = valid_log_probs.gather(1, flat_labels.unsqueeze(1)).squeeze(1)
+                result.update({
+                    'valid_token_count': int(valid_logits.shape[0]),
+                    'mean': valid_logits.mean().item(),
+                    'std': valid_logits.std(unbiased=False).item(),
+                    'rms': valid_logits.square().mean().sqrt().item(),
+                    'min': valid_logits.min().item(),
+                    'max': valid_logits.max().item(),
+                    'target_logprob_mean': target_log_probs.mean().item(),
+                    'target_logprob_std': target_log_probs.std(unbiased=False).item(),
+                    'top1_target_agreement': (
+                        valid_logits.argmax(dim=-1) == flat_labels).float().mean().item(),
+                })
         return result
 
     def _write_alignment_record(self, record):
