@@ -707,6 +707,33 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             return names, None
         return names, (total / count).item()
 
+    def _layer0_attention_weight_stats(self):
+        """Return aggregate statistics for Layer 0 attention weight tensors."""
+        values = []
+        names = []
+        for model in self.unwrapped_models or []:
+            for name, parameter in model.named_parameters():
+                if name.startswith('decoder.layers.0.self_attention.') and name.endswith('.weight'):
+                    values.append(parameter.detach().float().reshape(-1))
+                    names.append(name)
+        if not values:
+            return names, None
+        value = torch.cat(values)
+        finite = torch.isfinite(value)
+        finite_value = value[finite]
+        if finite_value.numel() == 0:
+            return names, {
+                'norm': None, 'abs_mean': None, 'std': None, 'rms': None,
+                'finite_count': 0,
+            }
+        return names, {
+            'norm': finite_value.norm().item(),
+            'abs_mean': finite_value.abs().mean().item(),
+            'std': finite_value.std(unbiased=False).item(),
+            'rms': finite_value.square().mean().sqrt().item(),
+            'finite_count': int(finite.sum().item()),
+        }
+
     def _write_alignment_record(self, record):
         if not self._is_debug_rank():
             return
@@ -2435,7 +2462,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                   logging_micro_batch: Optional[int] = None,
                   teacher_logits_mean: Optional[float] = None,
                   layer0_first_parameter_mean: Optional[float] = None,
-                  layer0_attention_weight_mean: Optional[float] = None):
+                  layer0_attention_weight_mean: Optional[float] = None,
+                  layer0_attention_weight_stats: Optional[Dict[str, Any]] = None):
         """Compute GKD loss (JSD + optional SFT loss)."""
         student_logits = output_tensor
 
@@ -2495,6 +2523,11 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             if layer0_attention_weight_mean is not None:
                 metric['layer0_attention_weight_mean'] = output_tensor.new_tensor(
                     layer0_attention_weight_mean).detach()
+            for stat_name in ('norm', 'abs_mean', 'std', 'rms', 'finite_count'):
+                stat_value = (layer0_attention_weight_stats or {}).get(stat_name)
+                if stat_value is not None:
+                    metric[f'layer0_attention_weight_{stat_name}'] = output_tensor.new_tensor(
+                        stat_value).detach()
         if sft_loss is not None:
             metric['jsd_loss'] = jsd_loss_val.detach().clone()
             metric['sft_loss'] = sft_loss.detach().clone()
@@ -2576,6 +2609,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             self._first_layer0_parameter_mean())
         layer0_attention_weight_names, layer0_attention_weight_mean = (
             self._layer0_attention_weight_mean())
+        _, layer0_attention_weight_stats = self._layer0_attention_weight_stats()
         if debug_active:
             teacher_labels = teacher_output.opsd_teacher_labels if teacher_output.opsd_teacher_labels is not None else labels
             record = {
@@ -2595,6 +2629,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'layer0_first_parameter_mean': layer0_first_parameter_mean,
                 'layer0_attention_weight_names': layer0_attention_weight_names,
                 'layer0_attention_weight_mean': layer0_attention_weight_mean,
+                'layer0_attention_weight_stats': layer0_attention_weight_stats,
             }
             if teacher_logits is None:
                 record['teacher_topk_logprobs'] = self._tensor_summary(teacher_output.topk_logprobs)
@@ -2609,7 +2644,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     f'loss={loss_value}, teacher_logits_mean={teacher_logits_mean}, '
                     f'layer0_first_parameter={layer0_first_parameter_name}, '
                     f'layer0_first_parameter_mean={layer0_first_parameter_mean}, '
-                    f'layer0_attention_weight_mean={layer0_attention_weight_mean}')
+                    f'layer0_attention_weight_mean={layer0_attention_weight_mean}, '
+                    f'layer0_attention_weight_stats={layer0_attention_weight_stats}')
                 self._write_alignment_record(record)
                 self._alignment_loss_context = None
 
@@ -2621,6 +2657,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 logging_micro_batch=micro_idx,
                 teacher_logits_mean=teacher_logits_mean,
                 layer0_first_parameter_mean=layer0_first_parameter_mean,
+                layer0_attention_weight_stats=layer0_attention_weight_stats,
                 layer0_attention_weight_mean=layer0_attention_weight_mean,
             )
 
@@ -2668,5 +2705,6 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             logging_micro_batch=micro_idx,
             teacher_logits_mean=teacher_logits_mean,
             layer0_first_parameter_mean=layer0_first_parameter_mean,
+            layer0_attention_weight_stats=layer0_attention_weight_stats,
             layer0_attention_weight_mean=layer0_attention_weight_mean,
         )
