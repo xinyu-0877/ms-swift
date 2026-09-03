@@ -14,7 +14,7 @@ from megatron.core import mpu
 from megatron.core.rerun_state_machine import RerunDataIterator
 from transformers import AutoConfig
 from transformers.utils import ContextManagers
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from swift.infer_engine.protocol import RequestConfig
 from swift.megatron.arguments import MegatronArguments
