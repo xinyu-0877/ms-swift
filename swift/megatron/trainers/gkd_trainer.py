@@ -682,6 +682,31 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 })
         return result
 
+    def _first_layer0_parameter_mean(self):
+        """Return the mean of the first Layer 0 parameter in model order."""
+        for model in self.unwrapped_models or []:
+            for name, parameter in model.named_parameters():
+                if name.startswith('decoder.layers.0.'):
+                    return name, parameter.detach().float().mean().item()
+        return None, None
+
+    def _layer0_attention_weight_mean(self):
+        """Return the element-weighted mean of Layer 0 attention weights."""
+        names = []
+        total = None
+        count = 0
+        prefix = 'decoder.layers.0.self_attention.'
+        for model in self.unwrapped_models or []:
+            for name, parameter in model.named_parameters():
+                if name.startswith(prefix) and name.endswith('.weight'):
+                    value = parameter.detach().float()
+                    total = value.sum() if total is None else total + value.sum()
+                    count += value.numel()
+                    names.append(name)
+        if total is None or count == 0:
+            return names, None
+        return names, (total / count).item()
+
     def _write_alignment_record(self, record):
         if not self._is_debug_rank():
             return
@@ -2406,7 +2431,11 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                   *,
                   labels: torch.Tensor,
                   teacher_output: TeacherOutput,
-                  data_source: DataSource = DataSource.DATASET):
+                  data_source: DataSource = DataSource.DATASET,
+                  logging_micro_batch: Optional[int] = None,
+                  teacher_logits_mean: Optional[float] = None,
+                  layer0_first_parameter_mean: Optional[float] = None,
+                  layer0_attention_weight_mean: Optional[float] = None):
         """Compute GKD loss (JSD + optional SFT loss)."""
         student_logits = output_tensor
 
@@ -2454,6 +2483,18 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             loss = loss + self.sft_alpha * sft_loss
 
         metric = {'loss': loss.detach().clone()}
+        if logging_micro_batch is not None:
+            # These scalar metrics are aggregated into the standard Megatron
+            # logging.jsonl record together with loss.
+            if teacher_logits_mean is not None:
+                metric[f'micro{logging_micro_batch}_teacher_logits_mean'] = output_tensor.new_tensor(
+                    teacher_logits_mean).detach()
+            if layer0_first_parameter_mean is not None:
+                metric['layer0_first_parameter_mean'] = output_tensor.new_tensor(
+                    layer0_first_parameter_mean).detach()
+            if layer0_attention_weight_mean is not None:
+                metric['layer0_attention_weight_mean'] = output_tensor.new_tensor(
+                    layer0_attention_weight_mean).detach()
         if sft_loss is not None:
             metric['jsd_loss'] = jsd_loss_val.detach().clone()
             metric['sft_loss'] = sft_loss.detach().clone()
@@ -2528,8 +2569,14 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._microbatch_backward_trace.capture_forward(
             data, labels, teacher_output, student_output, step, micro_idx)
 
+        teacher_logits = teacher_output.full_logits
+        teacher_logits_mean = (
+            teacher_logits.detach().float().mean().item() if teacher_logits is not None else None)
+        layer0_first_parameter_name, layer0_first_parameter_mean = (
+            self._first_layer0_parameter_mean())
+        layer0_attention_weight_names, layer0_attention_weight_mean = (
+            self._layer0_attention_weight_mean())
         if debug_active:
-            teacher_logits = teacher_output.full_logits
             teacher_labels = teacher_output.opsd_teacher_labels if teacher_output.opsd_teacher_labels is not None else labels
             record = {
                 'record_type': 'forward',
@@ -2541,6 +2588,13 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'num_valid': int((labels != -100).sum().item()) if labels is not None else None,
                 'student_logits': self._logits_summary(student_output, labels),
                 'teacher_logits': self._logits_summary(teacher_logits, teacher_labels),
+                # Full-vocabulary teacher logits mean for this exact step/micro.
+                # This is None when top-k teacher output is configured.
+                'teacher_logits_mean': teacher_logits_mean,
+                'layer0_first_parameter_name': layer0_first_parameter_name,
+                'layer0_first_parameter_mean': layer0_first_parameter_mean,
+                'layer0_attention_weight_names': layer0_attention_weight_names,
+                'layer0_attention_weight_mean': layer0_attention_weight_mean,
             }
             if teacher_logits is None:
                 record['teacher_topk_logprobs'] = self._tensor_summary(teacher_output.topk_logprobs)
@@ -2548,6 +2602,14 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
             def write_loss_record():
                 record['loss'] = self._alignment_loss_context
+                loss_context = self._alignment_loss_context or {}
+                loss_value = loss_context.get('loss', loss_context.get('jsd_loss'))
+                logger.info(
+                    f'GKD teacher/logging: step={step}, micro_batch={micro_idx}, '
+                    f'loss={loss_value}, teacher_logits_mean={teacher_logits_mean}, '
+                    f'layer0_first_parameter={layer0_first_parameter_name}, '
+                    f'layer0_first_parameter_mean={layer0_first_parameter_mean}, '
+                    f'layer0_attention_weight_mean={layer0_attention_weight_mean}')
                 self._write_alignment_record(record)
                 self._alignment_loss_context = None
 
@@ -2556,6 +2618,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 labels=labels,
                 teacher_output=teacher_output,
                 data_source=data_source,
+                logging_micro_batch=micro_idx,
+                teacher_logits_mean=teacher_logits_mean,
+                layer0_first_parameter_mean=layer0_first_parameter_mean,
+                layer0_attention_weight_mean=layer0_attention_weight_mean,
             )
 
             def debug_loss_callback(output_tensor):
@@ -2599,4 +2665,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             labels=labels,
             teacher_output=teacher_output,
             data_source=data_source,
+            logging_micro_batch=micro_idx,
+            teacher_logits_mean=teacher_logits_mean,
+            layer0_first_parameter_mean=layer0_first_parameter_mean,
+            layer0_attention_weight_mean=layer0_attention_weight_mean,
         )
