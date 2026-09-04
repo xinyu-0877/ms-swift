@@ -102,6 +102,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'decoder.layers.2.mlp.linear_fc2.weight',
             ]
         self._alignment_micro_counts = {}
+        self._dtype_audit_enabled = os.getenv('SWIFT_GKD_DTYPE_AUDIT', '0') == '1'
+        self._dtype_audit_model_done = False
+        self._dtype_audit_grad_done = False
+        self._dtype_audit_optimizer_done = False
         self._grad_clip_debug_dir = os.getenv('SWIFT_GKD_GRAD_CLIP_DEBUG_DIR')
         self._grad_clip_debug_tag = os.getenv('SWIFT_GKD_GRAD_CLIP_DEBUG_TAG', '').strip()
         self._grad_clip_debug_start_step = int(os.getenv('SWIFT_GKD_GRAD_CLIP_DEBUG_START_STEP', '0'))
@@ -501,6 +505,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def _before_optimizer_step(self):
         step = int(self.state.iteration)
+        self._dtype_audit_gradients(step)
+        self._dtype_audit_optimizer()
         if step == int(os.getenv('SWIFT_GKD_RUNTIME_AUDIT_STEP', '0')):
             update_runtime_audit_grad_dtypes(self, self.wrapped_models[0])
         if step in self._preclip_grad_steps and self._is_preclip_grad_capture_rank():
@@ -733,6 +739,69 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'rms': finite_value.square().mean().sqrt().item(),
             'finite_count': int(finite.sum().item()),
         }
+
+    def _dtype_audit_model(self, student_output=None, teacher_logits=None):
+        """Log runtime dtypes only when explicitly enabled; never changes computation."""
+        if not self._dtype_audit_enabled or self._dtype_audit_model_done or not self._is_debug_rank():
+            return
+        self._dtype_audit_model_done = True
+        logger.info(
+            f'GKD dtype audit config: torch_dtype={getattr(self.args, "torch_dtype", None)}, '
+            f'bf16={getattr(self.args, "bf16", None)}, '
+            f'attention_softmax_in_fp32={getattr(self.args, "attention_softmax_in_fp32", None)}, '
+            f'accumulate_allreduce_grads_in_fp32={getattr(self.args, "accumulate_allreduce_grads_in_fp32", None)}, '
+            f'use_precision_aware_optimizer={getattr(self.args, "use_precision_aware_optimizer", None)}, '
+            f'jsd_fp32={os.getenv("SWIFT_GKD_JSD_FP32", "0")}')
+        logger.info(
+            f'GKD dtype audit logits: student={getattr(student_output, "dtype", None)}, '
+            f'teacher={getattr(teacher_logits, "dtype", None)}')
+        for tag, models in (('student', self.unwrapped_models), ('teacher', self.teacher_models)):
+            if not models:
+                continue
+            checked = 0
+            for name, parameter in models[0].named_parameters():
+                if any(pattern in name for pattern in (
+                        'word_embeddings.weight', 'embedding',
+                        'decoder.layers.0.self_attention.linear_qkv.weight',
+                        'decoder.layers.0.self_attention.linear_proj.weight',
+                        'output_layer.weight')):
+                    logger.info(
+                        f'GKD dtype audit {tag}: {name}, parameter={parameter.dtype}, '
+                        f'shape={list(parameter.shape)}')
+                    checked += 1
+                    if checked >= 8:
+                        break
+
+    def _dtype_audit_gradients(self, step):
+        if not self._dtype_audit_enabled or self._dtype_audit_grad_done or not self._is_debug_rank():
+            return
+        self._dtype_audit_grad_done = True
+        targets = ('word_embeddings.weight', 'decoder.layers.0.self_attention.linear_qkv.weight',
+                   'decoder.layers.0.self_attention.linear_proj.weight', 'output_layer.weight')
+        for model_idx, model in enumerate(self.unwrapped_models or []):
+            for name, parameter in model.named_parameters():
+                if not any(target in name for target in targets):
+                    continue
+                grad = parameter.grad
+                main_grad = getattr(parameter, 'main_grad', None)
+                logger.info(
+                    f'GKD dtype audit grad: step={step}, model={model_idx}, name={name}, '
+                    f'parameter={parameter.dtype}, grad={getattr(grad, "dtype", None)}, '
+                    f'main_grad={getattr(main_grad, "dtype", None)}')
+
+    def _dtype_audit_optimizer(self):
+        if not self._dtype_audit_enabled or self._dtype_audit_optimizer_done or not self._is_debug_rank():
+            return
+        self._dtype_audit_optimizer_done = True
+        for group in self.optimizer.param_groups:
+            for parameter in group.get('params', []):
+                state = self.optimizer.state.get(parameter, {})
+                logger.info(
+                    f'GKD dtype audit optimizer: parameter={parameter.dtype}, '
+                    f'main_param={getattr(getattr(parameter, "main_param", None), "dtype", None)}, '
+                    f'exp_avg={getattr(state.get("exp_avg"), "dtype", None)}, '
+                    f'exp_avg_sq={getattr(state.get("exp_avg_sq"), "dtype", None)}')
+                return
 
     def _write_alignment_record(self, record):
         if not self._is_debug_rank():
@@ -2476,6 +2545,13 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             gather_fn=tp_gather_topk,
             log_softmax_fn=vocab_parallel_log_softmax,
             kl_div_fn=vocab_parallel_kl_div)
+        if self._dtype_audit_enabled and self._is_debug_rank() and not getattr(self, '_dtype_audit_jsd_done', False):
+            self._dtype_audit_jsd_done = True
+            logger.info(
+                f'GKD dtype audit JSD: student_input={student_logits.dtype}, '
+                f'teacher_input={getattr(teacher_output.full_logits, "dtype", None)}, '
+                f'jsd_total={jsd_total.dtype}, '
+                f'jsd_fp32={os.getenv("SWIFT_GKD_JSD_FP32", "0")}')
         jsd_loss_val = cp_reduce(jsd_total, jsd_num_valid, cp_size=self.args.context_parallel_size)
 
         debug_context = getattr(self, '_alignment_loss_context', None)
@@ -2587,6 +2663,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         finally:
             self._operator_debug_context = None
         write_runtime_audit(self, model, data, labels, teacher_output.full_logits, step, micro_idx)
+        self._dtype_audit_model(student_output, teacher_output.full_logits)
         if (self._flash_isolation_mode
                 and step == self._flash_isolation_step
                 and micro_idx == self._flash_isolation_micro_batch
