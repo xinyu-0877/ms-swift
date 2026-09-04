@@ -795,12 +795,27 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._dtype_audit_optimizer_done = True
         for group in self.optimizer.param_groups:
             for parameter in group.get('params', []):
-                state = self.optimizer.state.get(parameter, {})
+                # Distributed optimizers may expose state as ProxyDict rather
+                # than a normal dict; audit access must never abort training.
+                try:
+                    state = self.optimizer.state[parameter]
+                except (KeyError, TypeError, AttributeError):
+                    state = None
+                def state_value(name):
+                    if state is None:
+                        return None
+                    try:
+                        return state[name]
+                    except (KeyError, TypeError, AttributeError):
+                        return None
+                exp_avg = state_value('exp_avg')
+                exp_avg_sq = state_value('exp_avg_sq')
                 logger.info(
                     f'GKD dtype audit optimizer: parameter={parameter.dtype}, '
                     f'main_param={getattr(getattr(parameter, "main_param", None), "dtype", None)}, '
-                    f'exp_avg={getattr(state.get("exp_avg"), "dtype", None)}, '
-                    f'exp_avg_sq={getattr(state.get("exp_avg_sq"), "dtype", None)}')
+                    f'exp_avg={getattr(exp_avg, "dtype", None)}, '
+                    f'exp_avg_sq={getattr(exp_avg_sq, "dtype", None)}, '
+                    f'state_type={type(self.optimizer.state).__name__}')
                 return
 
     def _write_alignment_record(self, record):
