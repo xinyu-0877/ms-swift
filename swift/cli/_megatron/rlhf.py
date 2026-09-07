@@ -20,5 +20,13 @@ if __name__ == '__main__':
         ray_main()
     else:
         os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
+        # These variables must be present before importing torch/CUDA.  The
+        # full seed and PyTorch deterministic-algorithm setup is performed by
+        # swift.utils.deterministic after the Megatron entry point starts.
+        if os.getenv('SWIFT_GKD_DETERMINISTIC', '0').lower() in ('1', 'true', 'yes', 'on'):
+            det_seed = os.getenv('SWIFT_GKD_DETERMINISTIC_SEED', '42')
+            os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+            os.environ.setdefault('NVIDIA_TF32_OVERRIDE', '0')
+            os.environ.setdefault('PYTHONHASHSEED', det_seed)
         from swift.megatron import megatron_rlhf_main
         megatron_rlhf_main()

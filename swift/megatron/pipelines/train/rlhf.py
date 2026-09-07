@@ -4,7 +4,7 @@ from typing import List, Optional, Union
 
 from swift.megatron.arguments import MegatronRLHFArguments
 from swift.pipelines.train import prepare_kto_dataset
-from swift.utils import get_current_device, get_logger, is_last_rank
+from swift.utils import get_current_device, get_logger, is_last_rank, set_swift_deterministic
 from .sft import MegatronSft
 
 logger = get_logger()
@@ -70,4 +70,7 @@ class MegatronRLHF(MegatronSft):
 
 
 def megatron_rlhf_main(args: Optional[Union[List[str], MegatronRLHFArguments]] = None):
+    # Opt-in only: this is intended for repeated GPU-run diagnostics and does
+    # not alter normal training unless SWIFT_GKD_DETERMINISTIC=1 is exported.
+    set_swift_deterministic()
     return MegatronRLHF(args).main()
