@@ -73,6 +73,8 @@ GKD_FP32="${GKD_FP32:-true}"
 case "${GKD_FP32,,}" in
   1|true|yes|on)
     GKD_FP32=true
+    # Keep GPU/NPU effective precision symmetric: only core attention uses BF16.
+    export SWIFT_GKD_FLASH_BF16=1
     export SWIFT_GKD_STRICT_FP32=1
     export SWIFT_GKD_JSD_FP32=1
     export SWIFT_GKD_DTYPE_AUDIT=1
@@ -95,6 +97,7 @@ case "${GKD_FP32,,}" in
     ;;
   0|false|no|off)
     GKD_FP32=false
+    unset SWIFT_GKD_FLASH_BF16
     unset SWIFT_GKD_STRICT_FP32
     unset SWIFT_GKD_JSD_FP32
     unset SWIFT_GKD_DTYPE_AUDIT
@@ -167,6 +170,7 @@ npu-smi info
   echo "eval_batch_size=${EVAL_BATCH_SIZE}"
   echo "gradient_accumulation_steps=${GRAD_ACC}"
   echo "gkd_fp32=${GKD_FP32}"
+  echo "flash_bf16=${SWIFT_GKD_FLASH_BF16:-0}"
   echo "attention_backend=flash"
   echo "padding_free=true"
   echo "ascend_devices=${ASCEND_RT_VISIBLE_DEVICES}"

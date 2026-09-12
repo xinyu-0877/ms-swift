@@ -108,6 +108,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'decoder.layers.2.mlp.linear_fc2.weight',
             ]
         self._alignment_micro_counts = {}
+        self._flash_bf16_enabled = os.getenv('SWIFT_GKD_FLASH_BF16', '0') == '1'
+        self._flash_bf16_handles = []
         self._dtype_audit_enabled = os.getenv('SWIFT_GKD_DTYPE_AUDIT', '0') == '1'
         self._dtype_audit_model_done = False
         self._dtype_audit_grad_done = False
@@ -415,6 +417,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             self._attention_forward_trace.register_hooks()
         if self._microbatch_backward_trace.enabled:
             self._microbatch_backward_trace.register_hooks()
+        if self._flash_bf16_enabled:
+            self._register_flash_bf16_hooks()
 
     @staticmethod
     def _validate_strict_fp32_args(args):
@@ -454,6 +458,46 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         if mismatches:
             raise ValueError('SWIFT_GKD_STRICT_FP32 model config mismatch: ' + '; '.join(mismatches))
         logger.info('GKD strict FP32 configuration validated.')
+
+    @staticmethod
+    def _flash_bf16_cast_inputs(module, args, kwargs):
+        """Cast only Q/K/V passed to a Flash Attention core module."""
+        args = list(args)
+        for index in range(min(3, len(args))):
+            value = args[index]
+            if torch.is_tensor(value) and value.is_floating_point() and value.dtype == torch.float32:
+                args[index] = value.to(torch.bfloat16)
+        kwargs = dict(kwargs)
+        for name in ('query', 'key', 'value'):
+            value = kwargs.get(name)
+            if torch.is_tensor(value) and value.is_floating_point() and value.dtype == torch.float32:
+                kwargs[name] = value.to(torch.bfloat16)
+        return tuple(args), kwargs
+
+    @staticmethod
+    def _flash_bf16_cast_output(module, args, kwargs, output):
+        if torch.is_tensor(output) and output.is_floating_point() and output.dtype == torch.bfloat16:
+            return output.float()
+        return output
+
+    def _register_flash_bf16_hooks(self):
+        matched = []
+        for model_group, models in (('student', self.unwrapped_models), ('teacher', self.teacher_models)):
+            for model_index, model in enumerate(models or []):
+                for name, module in model.named_modules():
+                    if not name.endswith('.self_attention.core_attention'):
+                        continue
+                    pre_handle = module.register_forward_pre_hook(
+                        self._flash_bf16_cast_inputs, with_kwargs=True)
+                    output_handle = module.register_forward_hook(
+                        self._flash_bf16_cast_output, with_kwargs=True)
+                    self._flash_bf16_handles.extend([pre_handle, output_handle])
+                    matched.append(f'{model_group}{model_index}.{name} ({type(module).__name__})')
+        if not matched:
+            raise ValueError('SWIFT_GKD_FLASH_BF16=1 but no self_attention.core_attention module was found.')
+        logger.info(
+            f'GKD selective Flash Attention BF16 enabled; '
+            f'all non-attention paths remain FP32: {", ".join(matched)}')
 
     @staticmethod
     def _strict_fp32_tensor_error(name, tensor):
@@ -909,7 +953,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             f'attention_softmax_in_fp32={getattr(self.args, "attention_softmax_in_fp32", None)}, '
             f'accumulate_allreduce_grads_in_fp32={getattr(self.args, "accumulate_allreduce_grads_in_fp32", None)}, '
             f'use_precision_aware_optimizer={getattr(self.args, "use_precision_aware_optimizer", None)}, '
-            f'jsd_fp32={os.getenv("SWIFT_GKD_JSD_FP32", "0")}')
+            f'jsd_fp32={os.getenv("SWIFT_GKD_JSD_FP32", "0")}, '
+            f'flash_bf16={os.getenv("SWIFT_GKD_FLASH_BF16", "0")}')
         logger.info(
             f'GKD dtype audit logits: student={getattr(student_output, "dtype", None)}, '
             f'teacher={getattr(teacher_logits, "dtype", None)}')

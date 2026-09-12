@@ -75,6 +75,10 @@ case "${GKD_FP32,,}" in
   1|true|yes|on)
     GKD_FP32=true
     export NVIDIA_TF32_OVERRIDE=0
+    # Transformer Engine Flash Attention does not provide an FP32 kernel on
+    # this GPU stack. Cast only Q/K/V inside core attention to BF16; the
+    # surrounding model, loss, gradients, and optimizer remain FP32.
+    export SWIFT_GKD_FLASH_BF16=1
     export SWIFT_GKD_STRICT_FP32=1
     export SWIFT_GKD_JSD_FP32=1
     export SWIFT_GKD_DTYPE_AUDIT=1
@@ -98,6 +102,7 @@ case "${GKD_FP32,,}" in
   0|false|no|off)
     GKD_FP32=false
     unset NVIDIA_TF32_OVERRIDE
+    unset SWIFT_GKD_FLASH_BF16
     unset SWIFT_GKD_STRICT_FP32
     unset SWIFT_GKD_JSD_FP32
     unset SWIFT_GKD_DTYPE_AUDIT
@@ -171,6 +176,7 @@ nvidia-smi
   echo "eval_batch_size=${EVAL_BATCH_SIZE}"
   echo "gradient_accumulation_steps=${GRAD_ACC}"
   echo "gkd_fp32=${GKD_FP32}"
+  echo "flash_bf16=${SWIFT_GKD_FLASH_BF16:-0}"
   echo "attention_backend=flash"
   echo "padding_free=true"
   echo "cuda_devices=${CUDA_VISIBLE_DEVICES}"

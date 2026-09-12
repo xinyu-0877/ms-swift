@@ -126,6 +126,7 @@ def write_runtime_audit(trainer, model, data, labels, teacher_logits, step, micr
             'params_dtype', 'attention_backend', 'use_flash_attn', 'fp32_residual_connection')},
         'strict_fp32': os.getenv('SWIFT_GKD_STRICT_FP32', '0'),
         'jsd_fp32': os.getenv('SWIFT_GKD_JSD_FP32', '0'),
+        'flash_bf16': os.getenv('SWIFT_GKD_FLASH_BF16', '0'),
         'effective_ddp': {key: str(getattr(ddp, key, None)) for key in (
             'grad_reduce_in_fp32', 'overlap_grad_reduce', 'align_grad_reduce')},
         'effective_main_grad_dtypes': grad_dtypes,
