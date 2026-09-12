@@ -2779,8 +2779,25 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         return loss, metric
 
+    @staticmethod
+    def _unwrap_mcore_model(model):
+        """Return the Megatron model across DDP/Float16 wrapper variants."""
+        current = model
+        # Standard Megatron uses DDP -> Float16Module -> GPTModel, while
+        # some repatched/FSDP paths pass GPTModel directly or use one wrapper.
+        for _ in range(3):
+            if hasattr(current, 'get_input_tensor') and hasattr(current, 'vp_stage'):
+                return current
+            child = getattr(current, 'module', None)
+            if child is None or child is current:
+                break
+            current = child
+        raise RuntimeError(
+            'Unable to find the Megatron model in the forward wrapper: '
+            f'{type(model).__name__}')
+
     def forward_step(self, data_iterator, model):
-        unwrapped_model = model.module.module
+        unwrapped_model = self._unwrap_mcore_model(model)
         input_tensor = unwrapped_model.get_input_tensor()
         vp_stage = unwrapped_model.vp_stage
 
