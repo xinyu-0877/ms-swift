@@ -532,20 +532,38 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                         return
 
         parameter_idx = 0
-        for group in self.optimizer.param_groups:
-            for parameter in group.get('params', []):
-                inspect_value(f'optimizer.parameter[{parameter_idx}]', parameter)
-                inspect_value(f'optimizer.main_param[{parameter_idx}]', getattr(parameter, 'main_param', None))
-                try:
-                    state = self.optimizer.state[parameter]
-                except (KeyError, TypeError, AttributeError):
-                    state = None
-                inspect_value(f'optimizer.state[{parameter_idx}]', state)
-                parameter_idx += 1
+        for optimizer in self._optimizer_objects(self.optimizer):
+            for group in getattr(optimizer, 'param_groups', []) or []:
+                for parameter in group.get('params', []):
+                    inspect_value(f'optimizer.parameter[{parameter_idx}]', parameter)
+                    inspect_value(
+                        f'optimizer.main_param[{parameter_idx}]', getattr(parameter, 'main_param', None))
+                    parameter_idx += 1
+                    if len(errors) >= 8:
+                        break
                 if len(errors) >= 8:
                     break
             if len(errors) >= 8:
                 break
+
+            # Megatron's outer optimizer state may use composite keys such as
+            # (model_index, parameter_index). Inspect state entries directly
+            # instead of indexing it with a PyTorch Parameter.
+            state = getattr(optimizer, 'state', None)
+            if state is None:
+                continue
+            try:
+                state_items = iter(state.items())
+            except (AttributeError, TypeError):
+                continue
+            try:
+                for state_index, (_state_key, state_value) in enumerate(state_items):
+                    inspect_value(f'optimizer.state[{state_index}]', state_value)
+                    if len(errors) >= 8:
+                        break
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                # Dtype auditing must not change whether training can run.
+                continue
         if errors:
             raise RuntimeError('SWIFT_GKD_STRICT_FP32 optimizer dtype mismatch: ' + '; '.join(errors))
 
@@ -933,30 +951,27 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         if not self._dtype_audit_enabled or self._dtype_audit_optimizer_done or not self._is_debug_rank():
             return
         self._dtype_audit_optimizer_done = True
-        for group in self.optimizer.param_groups:
-            for parameter in group.get('params', []):
-                # Distributed optimizers may expose state as ProxyDict rather
-                # than a normal dict; audit access must never abort training.
-                try:
-                    state = self.optimizer.state[parameter]
-                except (KeyError, TypeError, AttributeError):
-                    state = None
-                def state_value(name):
-                    if state is None:
-                        return None
-                    try:
-                        return state[name]
-                    except (KeyError, TypeError, AttributeError):
-                        return None
-                exp_avg = state_value('exp_avg')
-                exp_avg_sq = state_value('exp_avg_sq')
-                logger.info(
-                    f'GKD dtype audit optimizer: parameter={parameter.dtype}, '
-                    f'main_param={getattr(getattr(parameter, "main_param", None), "dtype", None)}, '
-                    f'exp_avg={getattr(exp_avg, "dtype", None)}, '
-                    f'exp_avg_sq={getattr(exp_avg_sq, "dtype", None)}, '
-                    f'state_type={type(self.optimizer.state).__name__}')
-                return
+        for optimizer in self._optimizer_objects(self.optimizer):
+            state = getattr(optimizer, 'state', None)
+            if state is None:
+                continue
+            try:
+                state_items = iter(state.items())
+                state_key, state_value = next(state_items)
+            except (AttributeError, StopIteration, TypeError, RuntimeError, ValueError):
+                continue
+            if not isinstance(state_value, Mapping):
+                continue
+            exp_avg = state_value.get('exp_avg')
+            exp_avg_sq = state_value.get('exp_avg_sq')
+            parameter = state_key if torch.is_tensor(state_key) else None
+            logger.info(
+                f'GKD dtype audit optimizer: parameter={getattr(parameter, "dtype", None)}, '
+                f'main_param={getattr(getattr(parameter, "main_param", None), "dtype", None)}, '
+                f'exp_avg={getattr(exp_avg, "dtype", None)}, '
+                f'exp_avg_sq={getattr(exp_avg_sq, "dtype", None)}, '
+                f'state_type={type(state).__name__}, optimizer_type={type(optimizer).__name__}')
+            return
 
     def _write_alignment_record(self, record):
         if not self._is_debug_rank():
@@ -2052,9 +2067,12 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             if state is None:
                 continue
             for candidate in candidates:
-                if candidate not in state:
+                try:
+                    values = state.get(candidate)
+                except (AttributeError, KeyError, TypeError, RuntimeError, ValueError):
+                    values = None
+                if values is None:
                     continue
-                values = state[candidate]
                 master = candidate if candidate is not parameter else main_param
                 return {
                     'optimizer_type': optimizer_type,
