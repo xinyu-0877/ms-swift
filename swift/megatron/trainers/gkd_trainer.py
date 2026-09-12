@@ -7,6 +7,7 @@ import random
 import re
 import torch
 import torch.nn.functional as F
+from collections.abc import Mapping
 from contextlib import contextmanager
 from functools import partial
 from mcore_bridge import set_random_seed
@@ -44,6 +45,9 @@ logger = get_logger()
 class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def __init__(self, args: MegatronArguments, template, **kwargs):
+        self._strict_fp32 = os.getenv('SWIFT_GKD_STRICT_FP32', '0') == '1'
+        if self._strict_fp32:
+            self._validate_strict_fp32_args(args)
         # Controlled runtime audit: disable activation recomputation before the
         # base trainer constructs the model/configuration.
         if os.getenv('SWIFT_GKD_AUDIT_DISABLE_CORE_ATTN_RECOMPUTE', '0') == '1':
@@ -75,6 +79,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self.steps_per_generation = args.steps_per_generation
         self.generation_batch_size = args.generation_batch_size
         super().__init__(args, template)
+        if self._strict_fp32:
+            self._validate_strict_fp32_config()
 
         self._alignment_debug_start_step = int(os.getenv('SWIFT_GKD_ALIGNMENT_DEBUG_START_STEP', '0'))
         self._alignment_debug_steps = int(os.getenv('SWIFT_GKD_ALIGNMENT_DEBUG_STEPS', '0'))
@@ -410,6 +416,139 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         if self._microbatch_backward_trace.enabled:
             self._microbatch_backward_trace.register_hooks()
 
+    @staticmethod
+    def _validate_strict_fp32_args(args):
+        checks = {
+            'torch_dtype': (args.torch_dtype, torch.float32),
+            'fp16': (args.fp16, False),
+            'bf16': (args.bf16, False),
+            'attention_softmax_in_fp32': (args.attention_softmax_in_fp32, True),
+            'use_precision_aware_optimizer': (args.use_precision_aware_optimizer, False),
+            'main_grads_dtype': (args.main_grads_dtype, torch.float32),
+            'main_params_dtype': (args.main_params_dtype, torch.float32),
+            'exp_avg_dtype': (args.exp_avg_dtype, torch.float32),
+            'exp_avg_sq_dtype': (args.exp_avg_sq_dtype, torch.float32),
+            'accumulate_allreduce_grads_in_fp32': (args.accumulate_allreduce_grads_in_fp32, True),
+            'SWIFT_GKD_JSD_FP32': (os.getenv('SWIFT_GKD_JSD_FP32'), '1'),
+        }
+        mismatches = [
+            f'{name}={actual!r} (expected {expected!r})'
+            for name, (actual, expected) in checks.items() if actual != expected
+        ]
+        if getattr(args, 'fp8_format', None) is not None:
+            mismatches.append(f'fp8_format={args.fp8_format!r} (expected None)')
+        if mismatches:
+            raise ValueError('SWIFT_GKD_STRICT_FP32 configuration mismatch: ' + '; '.join(mismatches))
+
+    def _validate_strict_fp32_config(self):
+        config = self.config
+        checks = {
+            'config.params_dtype': (getattr(config, 'params_dtype', None), torch.float32),
+            'config.fp32_residual_connection': (
+                getattr(config, 'fp32_residual_connection', False), True),
+        }
+        mismatches = [
+            f'{name}={actual!r} (expected {expected!r})'
+            for name, (actual, expected) in checks.items() if actual != expected
+        ]
+        if mismatches:
+            raise ValueError('SWIFT_GKD_STRICT_FP32 model config mismatch: ' + '; '.join(mismatches))
+        logger.info('GKD strict FP32 configuration validated.')
+
+    @staticmethod
+    def _strict_fp32_tensor_error(name, tensor):
+        if torch.is_tensor(tensor) and tensor.is_floating_point() and tensor.dtype != torch.float32:
+            return f'{name}={tensor.dtype}'
+        return None
+
+    def _validate_strict_fp32_models(self, label, models):
+        if not self._strict_fp32 or not models:
+            return
+        errors = []
+        for model_idx, model in enumerate(models):
+            for kind, named_tensors in (
+                    ('parameter', model.named_parameters()), ('buffer', model.named_buffers())):
+                for name, tensor in named_tensors:
+                    error = self._strict_fp32_tensor_error(
+                        f'{label}[{model_idx}].{kind}.{name}', tensor)
+                    if error is not None:
+                        errors.append(error)
+                        if len(errors) >= 8:
+                            break
+                if len(errors) >= 8:
+                    break
+            if len(errors) >= 8:
+                break
+        if errors:
+            raise RuntimeError('SWIFT_GKD_STRICT_FP32 model dtype mismatch: ' + '; '.join(errors))
+
+    def _validate_strict_fp32_tensors(self, **tensors):
+        if not self._strict_fp32:
+            return
+        errors = [self._strict_fp32_tensor_error(name, tensor) for name, tensor in tensors.items()]
+        errors = [error for error in errors if error is not None]
+        if errors:
+            raise RuntimeError('SWIFT_GKD_STRICT_FP32 tensor dtype mismatch: ' + '; '.join(errors))
+
+    def _validate_strict_fp32_gradients(self):
+        if not self._strict_fp32:
+            return
+        errors = []
+        for model_idx, model in enumerate(self.unwrapped_models or []):
+            for name, parameter in model.named_parameters():
+                for grad_name, gradient in (
+                        ('grad', parameter.grad), ('main_grad', getattr(parameter, 'main_grad', None))):
+                    error = self._strict_fp32_tensor_error(
+                        f'student[{model_idx}].{name}.{grad_name}', gradient)
+                    if error is not None:
+                        errors.append(error)
+                        if len(errors) >= 8:
+                            break
+                if len(errors) >= 8:
+                    break
+            if len(errors) >= 8:
+                break
+        if errors:
+            raise RuntimeError('SWIFT_GKD_STRICT_FP32 gradient dtype mismatch: ' + '; '.join(errors))
+
+    def _validate_strict_fp32_optimizer(self):
+        if not self._strict_fp32:
+            return
+        errors = []
+
+        def inspect_value(name, value):
+            error = self._strict_fp32_tensor_error(name, value)
+            if error is not None:
+                errors.append(error)
+            elif isinstance(value, Mapping):
+                for key, child in value.items():
+                    inspect_value(f'{name}.{key}', child)
+                    if len(errors) >= 8:
+                        return
+            elif isinstance(value, (list, tuple)):
+                for index, child in enumerate(value):
+                    inspect_value(f'{name}[{index}]', child)
+                    if len(errors) >= 8:
+                        return
+
+        parameter_idx = 0
+        for group in self.optimizer.param_groups:
+            for parameter in group.get('params', []):
+                inspect_value(f'optimizer.parameter[{parameter_idx}]', parameter)
+                inspect_value(f'optimizer.main_param[{parameter_idx}]', getattr(parameter, 'main_param', None))
+                try:
+                    state = self.optimizer.state[parameter]
+                except (KeyError, TypeError, AttributeError):
+                    state = None
+                inspect_value(f'optimizer.state[{parameter_idx}]', state)
+                parameter_idx += 1
+                if len(errors) >= 8:
+                    break
+            if len(errors) >= 8:
+                break
+        if errors:
+            raise RuntimeError('SWIFT_GKD_STRICT_FP32 optimizer dtype mismatch: ' + '; '.join(errors))
+
     @property
     def _alignment_debug_path(self):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -507,6 +646,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         step = int(self.state.iteration)
         self._dtype_audit_gradients(step)
         self._dtype_audit_optimizer()
+        self._validate_strict_fp32_gradients()
         if step == int(os.getenv('SWIFT_GKD_RUNTIME_AUDIT_STEP', '0')):
             update_runtime_audit_grad_dtypes(self, self.wrapped_models[0])
         if step in self._preclip_grad_steps and self._is_preclip_grad_capture_rank():
@@ -2034,6 +2174,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             if debug_active and self._backward_debug_enabled else None
         )
         result = super().train_step(train_data_iterator)
+        self._validate_strict_fp32_optimizer()
         self._microbatch_backward_trace.finalize_train_step(
             step, self.args.num_microbatches)
         if self._grad_clip_debug_active(step):
@@ -2114,6 +2255,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def prepare_model(self):
         super().prepare_model()
+        self._validate_strict_fp32_models('student', self.unwrapped_models)
         cache_mode = os.getenv('SWIFT_GKD_TEACHER_CACHE_MODE', '').lower()
         cache_reuse_step = os.getenv('SWIFT_GKD_TEACHER_CACHE_REUSE_STEP')
         if cache_mode == 'load' and cache_reuse_step is not None:
@@ -2142,6 +2284,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             teacher_model.requires_grad_(False)
             teacher_model.eval()
         self.teacher_config.bridge.load_weights(self.teacher_models, args.teacher_model_dir)
+        self._validate_strict_fp32_models('teacher', self.teacher_models)
 
         # Offload teacher models to CPU if enabled
         if self.offload_teacher_model:
@@ -2550,6 +2693,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                   layer0_attention_weight_stats: Optional[Dict[str, Any]] = None):
         """Compute GKD loss (JSD + optional SFT loss)."""
         student_logits = output_tensor
+        self._validate_strict_fp32_tensors(
+            student_logits=student_logits,
+            teacher_logits=teacher_output.full_logits,
+            teacher_topk_logprobs=teacher_output.topk_logprobs)
 
         jsd_total, jsd_num_valid = gkd_loss(
             student_logits,
@@ -2560,6 +2707,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             gather_fn=tp_gather_topk,
             log_softmax_fn=vocab_parallel_log_softmax,
             kl_div_fn=vocab_parallel_kl_div)
+        self._validate_strict_fp32_tensors(jsd_total=jsd_total)
         if self._dtype_audit_enabled and self._is_debug_rank() and not getattr(self, '_dtype_audit_jsd_done', False):
             self._dtype_audit_jsd_done = True
             logger.info(
@@ -2586,6 +2734,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             if hasattr(model, 'language_model'):
                 model = model.language_model
             per_token_loss = model.compute_language_model_loss(labels, logits_sbv)
+            self._validate_strict_fp32_tensors(sft_per_token_loss=per_token_loss)
             loss_mask = labels != -100
             sft_loss_sum = (per_token_loss * loss_mask).sum()
             sft_loss_count = loss_mask.sum().float()
@@ -2600,6 +2749,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             sft_loss = sft_loss_sum / sft_loss_count
 
             loss = loss + self.sft_alpha * sft_loss
+
+        self._validate_strict_fp32_tensors(gkd_loss=loss)
 
         metric = {'loss': loss.detach().clone()}
         if logging_micro_batch is not None:
@@ -2677,6 +2828,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             student_output = model(**data)
         finally:
             self._operator_debug_context = None
+        self._validate_strict_fp32_tensors(
+            student_logits=student_output,
+            teacher_logits=teacher_output.full_logits,
+            teacher_topk_logprobs=teacher_output.topk_logprobs)
         write_runtime_audit(self, model, data, labels, teacher_output.full_logits, step, micro_idx)
         self._dtype_audit_model(student_output, teacher_output.full_logits)
         if (self._flash_isolation_mode

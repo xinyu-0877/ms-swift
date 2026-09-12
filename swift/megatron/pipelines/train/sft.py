@@ -23,6 +23,30 @@ else:
 logger = get_logger()
 
 
+def _configure_strict_fp32(args) -> None:
+    if os.getenv('SWIFT_GKD_STRICT_FP32', '0') != '1':
+        return
+    if args.torch_dtype != torch.float32 or args.fp16 or args.bf16:
+        raise ValueError(
+            'SWIFT_GKD_STRICT_FP32=1 requires --torch_dtype float32 '
+            '--fp16 false --bf16 false.')
+
+    # Keep FP32 matmuls from silently selecting TF32/HF32 accelerator modes.
+    torch.set_float32_matmul_precision('highest')
+    if torch.cuda.is_available():
+        if hasattr(torch.backends.cuda, 'matmul'):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch.backends.cudnn, 'allow_tf32'):
+            torch.backends.cudnn.allow_tf32 = False
+    npu = getattr(torch, 'npu', None)
+    if npu is not None:
+        for backend_name in ('matmul', 'conv'):
+            backend = getattr(npu, backend_name, None)
+            if backend is not None and hasattr(backend, 'allow_hf32'):
+                backend.allow_hf32 = False
+    logger.info('Strict FP32 execution enabled; TF32/HF32 accelerator modes are disabled where available.')
+
+
 class MegatronSft(SwiftSft):
     args_class = MegatronSftArguments
     args: args_class
@@ -43,6 +67,7 @@ class MegatronSft(SwiftSft):
         self.train_msg = {}
         super(SwiftSft, self).__init__(args)
         args = self.args
+        _configure_strict_fp32(args)
         if repatch is not None:
             megatron_args = asdict(self.args)
             if args.attention_backend != 'local':

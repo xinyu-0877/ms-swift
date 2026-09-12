@@ -113,13 +113,19 @@ def write_runtime_audit(trainer, model, data, labels, teacher_logits, step, micr
         'model_training': bool(model.training),
         'module_routes': routes,
         'args': {key: str(getattr(args, key, None)) for key in (
+            'torch_dtype', 'fp16', 'bf16', 'fp8_format',
             'attention_backend', 'use_flash_attn', 'padding_free', 'sequence_parallel',
+            'attention_softmax_in_fp32', 'apply_query_key_layer_scaling',
             'recompute_granularity', 'recompute_modules', 'bias_dropout_fusion',
             'bias_activation_fusion', 'gradient_accumulation_fusion',
             'cross_entropy_loss_fusion', 'overlap_grad_reduce', 'align_grad_reduce',
             'micro_batch_size', 'global_batch_size', 'data_parallel_size',
             'main_grads_dtype', 'main_params_dtype', 'exp_avg_dtype', 'exp_avg_sq_dtype',
-            'accumulate_allreduce_grads_in_fp32')},
+            'accumulate_allreduce_grads_in_fp32', 'use_precision_aware_optimizer')},
+        'model_config': {key: str(getattr(trainer.config, key, None)) for key in (
+            'params_dtype', 'attention_backend', 'use_flash_attn', 'fp32_residual_connection')},
+        'strict_fp32': os.getenv('SWIFT_GKD_STRICT_FP32', '0'),
+        'jsd_fp32': os.getenv('SWIFT_GKD_JSD_FP32', '0'),
         'effective_ddp': {key: str(getattr(ddp, key, None)) for key in (
             'grad_reduce_in_fp32', 'overlap_grad_reduce', 'align_grad_reduce')},
         'effective_main_grad_dtypes': grad_dtypes,
